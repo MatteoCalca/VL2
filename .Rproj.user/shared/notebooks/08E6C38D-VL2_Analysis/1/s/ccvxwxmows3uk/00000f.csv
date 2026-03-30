@@ -1,0 +1,4 @@
+"0","#| label: famd-inspect"
+"0","#| fig-height: 10"
+"0","fviz_famd_var(famd_result, repel = TRUE) +"
+"0","  labs(title = ""FAMD -- Variable Map (Dim 1 vs Dim 2)"")"

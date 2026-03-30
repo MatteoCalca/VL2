@@ -1,0 +1,11 @@
+"0","#| label: eda-categorical"
+"0","#| fig-height: 10"
+"0","p1 <- df_complete |>"
+"0","  count(limitare_auto, name = ""count"") |>"
+"0","  mutate(limitare_auto = fct_reorder(limitare_auto, count)) |>"
+"0","  ggplot(aes(count, limitare_auto)) +"
+"0","  geom_col(fill = ""steelblue"") +"
+"0","  labs(title = ""Limiting cars: improve or worsen?"", x = ""Count"", y = NULL)"
+"2","Errore in count(df_complete, limitare_auto, name = ""count"") : 
+  argomento non utilizzato (name = ""count"")
+"

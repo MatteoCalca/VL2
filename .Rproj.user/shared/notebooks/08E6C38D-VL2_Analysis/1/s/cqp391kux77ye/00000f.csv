@@ -1,0 +1,7 @@
+"0","#| label: famd-contributions"
+"0","#| fig-height: 8"
+"0","p_quanti <- fviz_contrib(famd_result, choice = ""quanti.var"", axes = 1:2)"
+"0","p_quali  <- fviz_contrib(famd_result, choice = ""quali.var"", axes = 1:2)"
+"2","Errore in `.rowNamesDF<-`(x, value = value) : 
+  'row.names' duplicate non sono ammesse
+"

@@ -1,0 +1,6 @@
+"0","#| label: medoids"
+"0","medoid_indices <- pam_fit$id.med"
+"0","df_complete |>"
+"0","  slice(medoid_indices) |>"
+"0","  select(cluster_pam, all_of(names(df_clust))) |>"
+"0","  knitr::kable(caption = ""PAM Medoids -- Representative Individuals per Cluster"")"

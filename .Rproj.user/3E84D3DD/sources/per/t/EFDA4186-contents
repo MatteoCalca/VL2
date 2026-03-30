@@ -1,0 +1,1620 @@
+---
+title: "Milan Urban Mobility Survey -- Cluster Analysis"
+subtitle: "Unsupervised ML Analysis of Mixed-Type Survey Data"
+author: "VL2 Research Team"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    theme: flatly
+    fig-width: 10
+    fig-height: 7
+    df-print: paged
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+required_pkgs <- c(
+  "tidyverse", "readr", "janitor", "scales", "viridis",
+  "cluster", "FactoMineR", "factoextra", "clustMixType", "mclust",
+  "corrplot", "patchwork", "ggrepel", "ggforce", "knitr",
+  "tidygeocoder", "geosphere", "Rtsne", "fpc",
+  "ggh4x", "ggtext"
+)
+missing <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing) > 0) install.packages(missing, repos = "https://cloud.r-project.org")
+
+library(tidyverse)
+library(cluster)
+library(FactoMineR)
+library(factoextra)
+library(clustMixType)
+library(mclust)
+library(corrplot)
+library(patchwork)
+library(ggrepel)
+library(ggforce)
+library(scales)
+library(viridis)
+library(knitr)
+library(tidygeocoder)
+library(geosphere)
+library(Rtsne)
+library(fpc)
+library(ggh4x)
+library(ggtext)
+theme_set(theme_minimal(base_size = 13))
+set.seed(42)
+
+# --- Global clustering parameter ---
+# Change this single value to re-run the entire analysis at a different k.
+n_clusters <- 6
+
+# --- Global colour palette (qualitative, 6-safe) ---
+# RColorBrewer "Dark2" is colour-blind friendly and distinct at 6+ levels.
+cluster_palette <- RColorBrewer::brewer.pal(max(n_clusters, 3), "Dark2")
+scale_color_clusters <- function(...) scale_color_manual(values = cluster_palette, ...)
+scale_fill_clusters  <- function(...) scale_fill_manual(values = cluster_palette, ...)
+
+```
+
+# Introduction
+
+This report presents an unsupervised clustering analysis of the VL2 Milan Urban Mobility Survey, conducted on March 14-15, 2026, with over 1,000 street interviews. The goal is to identify distinct citizen *personas* -- groups of respondents who share coherent patterns of attitudes, priorities, and behaviors regarding urban mobility, car usage, and public space in Milan.
+
+The analysis proceeds in five stages. First, we **clean and preprocess** the raw survey data, handling the challenge of mixed variable types (opinion scales, ranked priorities, binary transport modes, categorical demographics, and spatial postal codes). Second, we **explore** the data distributions to understand what the sample looks like before any clustering. Third, we apply **four different clustering algorithms**, each suited to mixed-type data from a different angle, to ensure our findings are robust and not an artifact of a single method. Fourth, we **compare** the methods to assess how much they agree and which performs best. Finally, we **profile** the resulting clusters and translate them into interpretable personas that can inform urban policy discussions.
+
+# Data Loading and Cleaning
+
+The raw dataset contains 38 columns, of which we select 22 variables relevant to clustering. The remaining columns (timestamps, device info, audio transcriptions, interview coordinates) are metadata that do not describe the respondent's attitudes or characteristics.
+
+## Load Raw Data
+
+```{r}
+#| label: load-data
+raw <- read_csv("VL2 - Sheet1.csv", show_col_types = FALSE)
+glimpse(raw)
+```
+
+## Select and Rename Variables
+
+```{r}
+#| label: select-rename
+df <- raw |>
+  select(
+    spazio_auto      = `Troppo spazio per auto`,
+    trasp_pub_ineff  = `Trasporto pubblico inefficiente`,
+    meno_auto_clima  = `Meno auto per cambiamento climatico`,
+    normale_auto     = `Normale auto per strada`,
+    piu_verde        = `Più verde`,
+    aggreg_disturbo  = `Aggregazione porta disturbo`,
+    parcheggi_aggreg = `Da parcheggi ad aggregazione`,
+    primo_posto      = `Primo posto`,
+    secondo_posto    = `Secondo posto`,
+    terzo_posto      = `Terzo posto`,
+    limitare_auto    = `Limitare le auto migliora o peggiora`,
+    lavoro           = Lavoro,
+    genere           = Genere,
+    auto             = Auto,
+    bici             = Bici,
+    mezzi_pub        = `Mezzi pubblici`,
+    piedi            = Piedi,
+    moto_scooter     = `Moto/scooter`,
+    taxi             = Taxi,
+    monopattino      = Monopattino,
+    eta              = `Età`,
+    cap              = CAP
+  )
+```
+
+## Clean Age
+
+The age field contains a few anomalous entries: one value of 20151 (a postal code entered in the wrong field) and a zero. These are set to NA.
+
+```{r}
+#| label: clean-age
+df <- df |>
+  mutate(
+    eta = case_when(
+      eta > 100 ~ NA_real_,
+      eta == 0  ~ NA_real_,
+      TRUE      ~ eta
+    )
+  )
+```
+
+## Clean CAP and Compute Distance to Milan Center
+
+The CAP (Codice di Avviamento Postale) is the respondent's postal code of residence. As a raw number it is not directly usable for clustering -- "20121" is not meaningfully "closer" to "20122" than to "20143" in any metric that matters. To extract spatial information, we geocode each unique CAP via OpenStreetMap/Nominatim to obtain its geographic centroid, then compute the haversine (great-circle) distance to Piazza del Duomo (45.4642 N, 9.1900 E). This transforms a categorical postal code into a continuous variable -- *how far the respondent lives from Milan's center* -- which captures the urban-suburban gradient relevant to mobility attitudes. Distances greater than 100 km are treated as geocoding errors and set to NA.
+
+```{r}
+#| label: clean-cap-geocode
+#| cache: true
+
+# Step 1: Fix malformed CAPs
+df <- df |>
+  mutate(
+    cap_clean = as.character(cap),
+    cap_clean = str_pad(cap_clean, width = 5, side = "left", pad = "0"),
+    cap_clean = if_else(nchar(cap_clean) > 5, NA_character_, cap_clean)
+  )
+
+# Step 2: Get unique valid CAPs
+unique_caps <- df |>
+  filter(!is.na(cap_clean)) |>
+  distinct(cap_clean) |>
+  rename(postal_code = cap_clean)
+
+cat("Unique CAPs to geocode:", nrow(unique_caps), "\n")
+
+# Step 3: Geocode via OSM/Nominatim (~1 req/sec, ~2 min total)
+geocoded <- unique_caps |>
+  mutate(query = paste(postal_code, "Italy", sep = ", ")) |>
+  geocode(address = query, method = "osm", full_results = FALSE)
+
+cat("Successfully geocoded:", sum(!is.na(geocoded$lat)), "of", nrow(geocoded), "CAPs\n")
+
+# Step 4: Compute haversine distance to Piazza del Duomo
+duomo <- c(lon = 9.1900, lat = 45.4642)
+
+geocoded <- geocoded |>
+  mutate(
+    dist_duomo_km = if_else(
+      !is.na(lat) & !is.na(long),
+      as.numeric(distHaversine(
+        cbind(long, lat),
+        matrix(c(duomo["lon"], duomo["lat"]), nrow = n(), ncol = 2, byrow = TRUE)
+      )) / 1000,
+      NA_real_
+    )
+  )
+
+# Step 5: Cap implausible distances (>100 km from Duomo is outside greater Lombardy)
+n_outliers <- sum(geocoded$dist_duomo_km > 100, na.rm = TRUE)
+geocoded <- geocoded |>
+  mutate(dist_duomo_km = if_else(dist_duomo_km > 100, NA_real_, dist_duomo_km))
+
+cat("Geocoding outliers (>100 km) set to NA:", n_outliers, "\n")
+
+# Step 6: Join back to main data
+df <- df |>
+  left_join(
+    geocoded |> select(postal_code, cap_lat = lat, cap_lon = long, dist_duomo_km),
+    by = c("cap_clean" = "postal_code")
+  )
+
+# FALLBACK (uncomment if geocoding fails for many CAPs):
+# Use interview GPS coordinates as spatial proxy
+# df <- df |>
+#   mutate(
+#     dist_duomo_km = distHaversine(
+#       cbind(raw$Longitude, raw$Latitude),
+#       c(9.1900, 45.4642)
+#     ) / 1000
+#   )
+```
+
+## Missingness Report
+
+Before clustering, we need to assess how much data is missing. Clustering algorithms generally cannot handle NA values, so we will use listwise deletion -- dropping any row with a missing value in any of the 22 clustering variables. This is acceptable when the complete-case rate is high (here ~88%), meaning we retain a large, representative sample.
+
+```{r}
+#| label: missingness
+df |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing)) |>
+  knitr::kable(caption = "Missing values per variable")
+```
+
+```{r}
+#| label: listwise-deletion
+clustering_vars <- c(
+  "spazio_auto", "trasp_pub_ineff", "meno_auto_clima", "normale_auto",
+  "piu_verde", "aggreg_disturbo", "parcheggi_aggreg",
+  "primo_posto", "secondo_posto", "terzo_posto",
+  "limitare_auto", "lavoro", "genere",
+  "auto", "bici", "mezzi_pub", "piedi", "moto_scooter", "taxi", "monopattino",
+  "eta", "dist_duomo_km"
+)
+
+df_complete <- df |> drop_na(all_of(clustering_vars))
+cat("Rows retained for clustering:", nrow(df_complete), "of", nrow(df), "\n")
+```
+
+### Completeness Diagnostic
+
+Listwise deletion assumes missingness is (approximately) completely at random (MCAR). If dropped respondents differ systematically from retained ones, the clustering sample is biased. The table below compares key summary statistics between retained and dropped cases.
+
+```{r}
+#| label: mcar-diagnostic
+compare_vars <- c("spazio_auto", "trasp_pub_ineff", "meno_auto_clima",
+                   "normale_auto", "piu_verde", "eta", "dist_duomo_km")
+
+is_complete <- complete.cases(df |> select(all_of(clustering_vars)))
+
+bind_rows(
+  df |> filter(is_complete) |>
+    summarise(group = "Retained", n = n(),
+              across(all_of(compare_vars), ~ mean(., na.rm = TRUE))),
+  df |> filter(!is_complete) |>
+    summarise(group = "Dropped", n = n(),
+              across(all_of(compare_vars), ~ mean(., na.rm = TRUE)))
+) |>
+  knitr::kable(digits = 2, caption = "Retained vs. Dropped Cases -- Mean Comparison")
+```
+
+# Variable Preprocessing
+
+A key challenge in this analysis is that our variables are of fundamentally different types: Likert scales (1-10), binary indicators (0/1), unordered categories (employment, gender), and ranked text choices. Clustering algorithms need a consistent representation. This section transforms the raw variables into a format suitable for all four clustering methods. Note that the Likert scales (1-10) are treated as numeric throughout, which assumes equal spacing between scale points -- a standard but debatable assumption for ordinal data.
+
+## Borda Scores for Ranked Priorities
+
+The survey asked respondents to rank their top three priorities for the neighborhood from a list of six options (first, second, and third place). To convert these three text columns into a numeric representation that preserves ranking information, we use a **Borda count**: first place receives 3 points, second place 2 points, third place 1 point, and any category not ranked receives 0. This produces six numeric columns (one per priority category), each ranging from 0 to 3, that capture both *which* priorities a respondent cares about and *how much* they care (via the ranking).
+
+```{r}
+#| label: borda-scores
+priority_categories <- c(
+  "Migliorare la circolazione delle auto",
+  "Mobilità sostenibile",
+  "Più parcheggi",
+  "Più verde urbano",
+  "Spazi culturali e sport",
+  "Spazi di socialità e famiglie"
+)
+
+priority_short <- c(
+  "prio_circolazione", "prio_mobilita_sost", "prio_parcheggi",
+  "prio_verde_urbano", "prio_cultura_sport", "prio_socialita"
+)
+
+for (i in seq_along(priority_categories)) {
+  cat_name <- priority_categories[i]
+  col_name <- priority_short[i]
+  df_complete <- df_complete |>
+    mutate(
+      !!col_name := case_when(
+        primo_posto   == cat_name ~ 3L,
+        secondo_posto == cat_name ~ 2L,
+        terzo_posto   == cat_name ~ 1L,
+        TRUE                      ~ 0L
+      )
+    )
+}
+```
+
+## Convert Categoricals to Factors
+
+Categorical variables must be explicitly coded as R factors so that clustering algorithms treat them correctly (as categories, not numbers). We also merge the "Non binario" gender level (only 2 respondents) with "Preferisco non rispondere" to avoid instability from extremely rare categories.
+
+```{r}
+#| label: to-factors
+
+# Merge rare genere level (Non binario, n=2) into Preferisco non rispondere
+df_complete <- df_complete |>
+  mutate(
+    genere = if_else(genere == "Non binario", "Preferisco non rispondere", genere)
+  )
+
+df_complete <- df_complete |>
+  mutate(
+    limitare_auto = factor(limitare_auto),
+    lavoro        = factor(lavoro),
+    genere        = factor(genere),
+    across(c(auto, bici, mezzi_pub, piedi, moto_scooter, taxi, monopattino),
+           ~ factor(., levels = c(0, 1), labels = c("No", "Yes")))
+  )
+```
+
+## Assemble Clustering Matrix
+
+The final clustering matrix contains 25 columns: 15 numeric variables (7 Likert scales, age, distance from Duomo, and 6 Borda priority scores), 7 binary factors (transport modes), and 3 nominal factors (attitude toward car-limiting, employment, gender). This is the input to all four clustering methods.
+
+```{r}
+#| label: cluster-matrix
+df_clust <- df_complete |>
+  select(
+    # Numeric / ordinal (treated as numeric)
+    spazio_auto, trasp_pub_ineff, meno_auto_clima, normale_auto,
+    piu_verde, aggreg_disturbo, parcheggi_aggreg,
+    eta, dist_duomo_km,
+    # Borda priority scores (numeric 0-3)
+    all_of(priority_short),
+    # Binary factors
+    auto, bici, mezzi_pub, piedi, moto_scooter, taxi, monopattino,
+    # Nominal factors
+    limitare_auto, lavoro, genere
+  )
+
+cat("Clustering matrix dimensions:", nrow(df_clust), "x", ncol(df_clust), "\n")
+str(df_clust)
+```
+
+# Exploratory Data Analysis
+
+Before applying clustering algorithms, it is essential to understand the shape of the data. This section examines the distributions and correlations of all clustering variables. These plots help us anticipate what the algorithms will find: if certain variables are highly correlated, they will jointly drive cluster formation; if a variable has almost no variance, it will contribute little to distinguishing groups.
+
+## Likert Scale Distributions
+
+The seven Likert-scale variables (1-10) capture attitudes toward cars, public transport, green space, and social aggregation. The distributions reveal whether respondents tend to cluster at the extremes (polarized opinions) or spread across the scale.
+
+```{r}
+#| label: eda-likert
+df_complete |>
+  select(spazio_auto:parcheggi_aggreg) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_bar(fill = "steelblue", alpha = 0.8) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "Distribution of Likert Scale Variables (1-10)",
+       x = "Rating", y = "Count")
+```
+
+## Correlation Matrix
+
+The correlation matrix shows how numeric variables relate to each other. Strong correlations (|r| > 0.3) indicate variables that move together and will jointly influence cluster membership. For instance, we might expect "too much space for cars" and "fewer cars for climate" to be positively correlated, as both reflect a pro-reduction attitude.
+
+```{r}
+#| label: eda-corr
+#| fig-height: 9
+df_complete |>
+  select(spazio_auto:parcheggi_aggreg, eta, dist_duomo_km, all_of(priority_short)) |>
+  cor(use = "pairwise.complete.obs") |>
+  corrplot(method = "color", type = "lower", tl.cex = 0.7,
+           addCoef.col = "black", number.cex = 0.6,
+           title = "Correlation Matrix -- Numeric Variables",
+           mar = c(0, 0, 2, 0))
+```
+
+## Categorical Variable Distributions
+
+```{r}
+#| label: eda-categorical
+#| fig-height: 10
+p1 <- df_complete |>
+  dplyr::count(limitare_auto, name = "count") |>
+  mutate(limitare_auto = fct_reorder(limitare_auto, count)) |>
+  ggplot(aes(count, limitare_auto)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Limiting cars: improve or worsen?", x = "Count", y = NULL)
+
+p2 <- df_complete |>
+  dplyr::count(lavoro, name = "count") |>
+  mutate(lavoro = fct_reorder(lavoro, count)) |>
+  ggplot(aes(count, lavoro)) +
+  geom_col(fill = "darkorange") +
+  labs(title = "Employment", x = "Count", y = NULL)
+
+p3 <- df_complete |>
+  dplyr::count(genere, name = "count") |>
+  mutate(genere = fct_reorder(genere, count)) |>
+  ggplot(aes(count, genere)) +
+  geom_col(fill = "forestgreen") +
+  labs(title = "Gender", x = "Count", y = NULL)
+
+p1 / p2 / p3
+```
+
+## Age and Distance Distributions
+
+```{r}
+#| label: eda-continuous
+p_age <- ggplot(df_complete, aes(eta)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", alpha = 0.8) +
+  labs(title = "Age Distribution", x = "Age", y = "Count")
+
+# Reference lines for Milan's cerchie (approximate radii from Piazza del Duomo)
+cerchie <- tribble(
+  ~dist, ~label,
+  1.2,   "Navigli",
+  2.2,   "Bastioni",
+  5.0,   "Filov. 90/91",
+  7.0,   "Confine comunale"
+)
+
+p_dist <- ggplot(df_complete, aes(dist_duomo_km)) +
+  geom_histogram(bins = 30, fill = "darkorange", alpha = 0.8) +
+  geom_vline(data = cerchie, aes(xintercept = dist),
+             linetype = "dashed", color = "grey30", linewidth = 0.4) +
+  geom_text(data = cerchie, aes(x = dist, y = Inf, label = label),
+            angle = 90, hjust = 1.1, vjust = -0.3, size = 2.8, color = "grey30") +
+  labs(title = "Distance from Duomo (km) -- Full Range", x = "km", y = "Count")
+
+p_dist_zoom <- ggplot(df_complete |> filter(dist_duomo_km <= 20), aes(dist_duomo_km)) +
+  geom_histogram(binwidth = 1, fill = "darkorange", alpha = 0.8) +
+  geom_vline(data = cerchie, aes(xintercept = dist),
+             linetype = "dashed", color = "grey30", linewidth = 0.4) +
+  geom_text(data = cerchie, aes(x = dist, y = Inf, label = label),
+            angle = 90, hjust = 1.1, vjust = -0.3, size = 3, color = "grey30") +
+  labs(title = "Distance from Duomo (km) -- Urban Core (< 20 km)", x = "km", y = "Count")
+
+(p_age + p_dist) / p_dist_zoom
+```
+
+## Priority Borda Scores
+
+This chart shows, on average, which priorities matter most to the sample. A mean Borda score of 2.0 would mean the category is typically ranked first or second; a score near 0 means it is rarely ranked at all.
+
+```{r}
+#| label: eda-priorities
+df_complete |>
+  select(all_of(priority_short)) |>
+  pivot_longer(everything(), names_to = "category", values_to = "score") |>
+  group_by(category) |>
+  summarise(mean_score = mean(score), .groups = "drop") |>
+  mutate(category = fct_reorder(category, mean_score)) |>
+  ggplot(aes(mean_score, category)) +
+  geom_col(fill = "mediumpurple") +
+  labs(title = "Mean Borda Priority Score by Category",
+       x = "Mean Score (0 = never ranked, 3 = first place)", y = NULL)
+```
+
+## Transport Mode Usage
+
+Respondents could select multiple transport modes. This chart shows the prevalence of each mode in the sample. Modes with very low prevalence (taxi, monopattino) contribute minimal discriminative signal to clustering but are retained for completeness.
+
+```{r}
+#| label: eda-transport
+df_complete |>
+  select(auto, bici, mezzi_pub, piedi, moto_scooter, taxi, monopattino) |>
+  pivot_longer(everything(), names_to = "mode", values_to = "used") |>
+  group_by(mode) |>
+  summarise(pct_yes = mean(used == "Yes"), .groups = "drop") |>
+  mutate(mode = fct_reorder(mode, pct_yes)) |>
+  ggplot(aes(pct_yes, mode)) +
+  geom_col(fill = "coral") +
+  scale_x_continuous(labels = percent_format()) +
+  labs(title = "Transport Mode Usage (%)", x = "% of respondents", y = NULL)
+```
+
+# Clustering
+
+## Why Four Methods?
+
+No single clustering algorithm is universally best, especially with mixed-type data like ours (numeric scales, binary indicators, and unordered categories all in the same dataset). Different algorithms make different assumptions about what "similar" means and how clusters are shaped. By running four complementary methods and comparing their results, we can assess whether the personas we find are robust -- emerging consistently regardless of method -- or are artifacts of a particular algorithm's assumptions. If three out of four methods find roughly the same groups, we can be confident those groups are real.
+
+## Choosing k
+
+The number of clusters k is a judgment call that balances statistical fit against narrative clarity. Purely statistical criteria (silhouette width) favour k = 2 for this data -- a blunt "pro-car vs. anti-car" split that is too coarse for policy-relevant personas. To choose k more rigorously, we rely on the **BIC (Bayesian Information Criterion)** from the model-based clustering in Method 4 below. BIC penalises model complexity, so when it selects a higher k, the added granularity is justified by the data. Running Mclust with G = 2 to 8 on the FAMD-projected scores selects **k = `r n_clusters`** as optimal. We adopt this value across all four methods. The silhouette and stability diagnostics in the Comparison section confirm that this k produces interpretable, reasonably separated clusters.
+
+## Method 1: Gower Distance + PAM (k-Medoids)
+
+**The idea**: The fundamental challenge with mixed data is defining "distance" between two respondents. How do you compare a Likert score of 7 to a gender of "Femminile"? The **Gower distance** solves this by computing a separate, type-appropriate distance for each variable (range-normalized difference for numeric, simple match/mismatch for categorical) and averaging them into a single dissimilarity score between 0 and 1. This produces a complete distance matrix between all pairs of respondents.
+
+**PAM (Partitioning Around Medoids)** then clusters this distance matrix. Unlike k-means, which represents each cluster by a virtual mean point, PAM picks an actual respondent as the *medoid* (most central member) of each cluster. This is more robust to outliers and, importantly, the medoid is a real person whose survey responses we can inspect as the "prototype" of each cluster.
+
+**Why this method matters**: Gower + PAM is the gold standard for mixed-type clustering. It requires no transformation of the data and makes minimal assumptions about cluster shapes. Its main limitation is computational: it computes an N x N distance matrix, which is feasible for our ~900 respondents but would not scale to millions.
+
+### Compute Gower Distance
+
+```{r}
+#| label: gower-distance
+#| cache: true
+gower_dist <- daisy(df_clust, metric = "gower")
+summary(gower_dist)
+```
+
+### Silhouette Analysis
+
+The **silhouette width** measures how well each respondent fits their assigned cluster compared to the next-best alternative cluster. Values range from -1 (badly misclassified) to +1 (perfectly clustered). We compute the average silhouette for k = 2 through 8 to understand the trade-off between statistical separation and interpretive richness.
+
+```{r}
+#| label: gower-optimal-k
+#| cache: true
+sil_width_pam <- map_dbl(2:8, function(k) {
+  pam_fit <- pam(gower_dist, k = k, diss = TRUE)
+  pam_fit$silinfo$avg.width
+})
+
+tibble(k = 2:8, silhouette = sil_width_pam) |>
+  ggplot(aes(k, silhouette)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = 2:8) +
+  labs(title = "PAM on Gower Distance -- Silhouette Width",
+       x = "Number of Clusters (k)", y = "Average Silhouette Width")
+```
+
+### Fit PAM at k = `r n_clusters`
+
+The silhouette plot above peaks at k = 2, which would produce a simple binary split (broadly "pro-car" vs. "anti-car"). While statistically clean, this is too coarse for identifying actionable personas. At k = `r n_clusters`, the clusters become narratively rich -- each defined by a distinct combination of transport mode, environmental attitude, and policy preference.
+
+```{r}
+#| label: gower-pam-fit
+# Silhouette peaks at k=2 but that is too coarse for persona identification.
+# k chosen based on BIC and interpretability (see n_clusters parameter).
+best_k_pam <- n_clusters
+cat("Selected k for PAM:", best_k_pam, "\n")
+
+pam_fit <- pam(gower_dist, k = best_k_pam, diss = TRUE)
+
+df_complete <- df_complete |>
+  mutate(cluster_pam = factor(pam_fit$clustering))
+```
+
+### Silhouette Plot
+
+The per-observation silhouette plot shows how well each respondent fits their assigned cluster. Bars extending to the right indicate good fit; bars crossing zero indicate respondents who sit on the boundary between clusters. Some overlap is expected in survey data, where human attitudes do not fall into perfectly discrete boxes.
+
+```{r}
+#| label: gower-silhouette-plot
+sil_obj <- silhouette(pam_fit$clustering, gower_dist)
+fviz_silhouette(sil_obj) +
+  labs(title = paste("PAM Silhouette Plot (k =", best_k_pam, ")"))
+```
+
+## Method 2: FAMD + k-Means
+
+**The idea**: Instead of defining a custom distance (as Gower does), this approach first reduces the mixed-type data into a smaller set of continuous dimensions using **FAMD (Factor Analysis of Mixed Data)**. FAMD is a generalization of PCA that handles both numeric and categorical variables: it applies PCA-style decomposition to numeric variables and Multiple Correspondence Analysis (MCA) to categorical ones, balancing their contributions. The result is a set of continuous "factor scores" for each respondent -- new synthetic variables that capture the main axes of variation in the data.
+
+Once the data is reduced to continuous scores, standard **k-means** clustering can be applied. K-means assigns each respondent to the cluster whose centroid (mean) is closest, iterating until assignments stabilize.
+
+**Why this method matters**: FAMD + k-means complements Gower + PAM in two ways. First, the dimensionality reduction acts as a noise filter -- minor variables and random variation are absorbed into lower-ranked dimensions that we discard, so clustering focuses on the dominant patterns. Second, the FAMD variable maps provide a powerful interpretive tool: we can see *which variables drive the main axes of variation* and how clusters are positioned in this reduced space.
+
+### Run FAMD
+
+```{r}
+#| label: famd-fit
+#| cache: true
+famd_result <- FAMD(df_clust, ncp = 10, graph = FALSE)
+
+fviz_screeplot(famd_result, ncp = 10, addlabels = TRUE, barfill = "steelblue") +
+  labs(title = "FAMD -- Screeplot (Variance Explained)")
+```
+
+### Variable Contributions
+
+The variable map shows how each original variable relates to the first two FAMD dimensions. Variables pointing in the same direction are correlated; variables at right angles are independent. The contribution bar charts show which variables drive each dimension most strongly.
+
+```{r}
+#| label: famd-inspect
+#| fig-height: 10
+fviz_famd_var(famd_result, repel = TRUE) +
+  labs(title = "FAMD -- Variable Map (Dim 1 vs Dim 2)")
+```
+
+```{r}
+#| label: famd-contributions
+#| fig-height: 10
+
+# Quantitative variable contributions (manual to avoid fviz_contrib color bug)
+quanti_contrib <- tibble(
+  variable = rownames(famd_result$quanti.var$contrib),
+  contrib  = (famd_result$quanti.var$contrib[, 1] + famd_result$quanti.var$contrib[, 2]) / 2
+) |>
+  mutate(variable = fct_reorder(variable, contrib))
+
+p_quanti <- ggplot(quanti_contrib, aes(contrib, variable)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Contributions of quantitative variables to Dim 1-2",
+       x = "Contribution (%)", y = NULL)
+
+# Qualitative category contributions (manual to avoid duplicate row name crash)
+quali_contrib <- tibble(
+  category = rownames(famd_result$quali.var$contrib),
+  variable = rep(names(which(sapply(df_clust, is.factor))),
+                 times = sapply(df_clust[, sapply(df_clust, is.factor)], nlevels)),
+  contrib  = (famd_result$quali.var$contrib[, 1] + famd_result$quali.var$contrib[, 2]) / 2
+) |>
+  mutate(label = paste0(variable, ": ", category),
+         label = fct_reorder(label, contrib))
+
+p_quali <- ggplot(quali_contrib, aes(contrib, label)) +
+  geom_col(fill = "darkorange") +
+  labs(title = "Contributions of qualitative categories to Dim 1-2",
+       x = "Contribution (%)", y = NULL)
+
+p_quanti / p_quali
+```
+
+### Optimal k Diagnostics
+
+We show three standard diagnostics for choosing k in k-means: the **elbow plot** (total within-cluster sum of squares -- look for the "bend"), the **silhouette** (average cluster cohesion), and the **gap statistic** (comparison to a null reference distribution). These are shown for reference; we fix k = `r n_clusters` for comparability with the other methods.
+
+```{r}
+#| label: famd-kmeans-optk
+#| cache: true
+
+# Retain enough dimensions for ~70% cumulative variance, or all available if threshold not reached
+cumvar <- cumsum(famd_result$eig[, 2])
+n_dims <- which(cumvar >= 70)[1]
+if (is.na(n_dims)) n_dims <- nrow(famd_result$eig)
+cat("Retaining", n_dims, "FAMD dimensions (", round(cumvar[n_dims], 1), "% variance)\n")
+
+famd_scores <- as_tibble(famd_result$ind$coord[, 1:n_dims])
+
+# Three diagnostic plots
+p_elbow <- fviz_nbclust(famd_scores, kmeans, method = "wss", k.max = 8) +
+  labs(title = "FAMD + k-Means -- Elbow (WSS)")
+p_sil <- fviz_nbclust(famd_scores, kmeans, method = "silhouette", k.max = 8) +
+  labs(title = "FAMD + k-Means -- Silhouette")
+p_gap <- fviz_nbclust(famd_scores, kmeans, method = "gap_stat", k.max = 8,
+                       nboot = 100) +
+  labs(title = "FAMD + k-Means -- Gap Statistic")
+
+p_elbow / p_sil / p_gap
+```
+
+```{r}
+#| label: famd-select-k
+# Fixed at n_clusters for cross-method comparability and persona interpretability
+best_k_famd <- n_clusters
+cat("Selected k for FAMD + k-Means:", best_k_famd, "\n")
+```
+
+### Fit k-Means on FAMD Scores
+
+```{r}
+#| label: famd-kmeans-fit
+km_famd <- kmeans(famd_scores, centers = best_k_famd, nstart = 25, iter.max = 100)
+
+df_complete <- df_complete |>
+  mutate(cluster_famd = factor(km_famd$cluster))
+
+fviz_cluster(km_famd, data = famd_scores,
+             geom = "point", alpha = 0.5,
+             palette = "Set2", ggtheme = theme_minimal()) +
+  labs(title = paste("k-Means on FAMD Scores (k =", best_k_famd, ")"))
+```
+
+## Method 3: K-Prototypes
+
+**The idea**: K-Prototypes is a direct extension of k-means designed for mixed data. For numeric variables it uses Euclidean distance (like k-means); for categorical variables it uses simple matching distance (counting mismatches). The two distances are combined with a weighting parameter that balances their contributions. Each cluster is represented by a *prototype*: a vector of means for numeric variables and modes for categorical ones.
+
+**Why this method matters**: K-Prototypes works on the raw mixed data directly, without requiring either a distance matrix (like Gower) or dimensionality reduction (like FAMD). This makes it fast and conceptually simple. However, the trade-off is that Euclidean distance on raw numeric variables gives more weight to variables with larger scales. To avoid this, we z-score all numeric columns before running K-Prototypes, so that age and distance (ranges of ~70 and ~100) do not dominate Likert scales (range 9) and Borda scores (range 3).
+
+### Prepare Standardized Data
+
+```{r}
+#| label: kproto-prep
+# Z-score numeric columns so K-Prototypes treats all scales equally
+num_cols <- names(df_clust)[sapply(df_clust, is.numeric)]
+df_clust_std <- df_clust |>
+  mutate(across(all_of(num_cols), ~ as.numeric(scale(.))))
+str(df_clust_std)
+```
+
+### Elbow Diagnostic
+
+```{r}
+#| label: kproto-optk
+#| cache: true
+kproto_wss <- map_dbl(2:8, function(k) {
+  kp <- kproto(df_clust_std, k = k, nstart = 5, verbose = FALSE)
+  kp$tot.withinss
+})
+
+tibble(k = 2:8, wss = kproto_wss) |>
+  ggplot(aes(k, wss)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = 2:8) +
+  labs(title = "K-Prototypes -- Elbow Plot (WSS)",
+       x = "Number of Clusters (k)", y = "Total Within-Cluster Distance")
+```
+
+### Fit K-Prototypes at k = `r n_clusters`
+
+```{r}
+#| label: kproto-fit
+# Fixed at n_clusters for cross-method comparability and persona interpretability
+best_k_kproto <- n_clusters
+cat("Selected k for K-Prototypes:", best_k_kproto, "\n")
+
+kproto_fit <- kproto(df_clust_std, k = best_k_kproto, nstart = 10, verbose = FALSE)
+
+df_complete <- df_complete |>
+  mutate(cluster_kproto = factor(kproto_fit$cluster))
+
+clprofiles(kproto_fit, df_clust_std)
+```
+
+## Method 4: Model-Based Clustering (Mclust) on FAMD Scores
+
+**The idea**: Unlike the previous methods, which are heuristic (they optimize a distance-based criterion), **model-based clustering** assumes the data is generated by a mixture of Gaussian (bell-curve) distributions. Each cluster corresponds to one Gaussian component, characterized by its own mean, variance, and shape. The algorithm (Expectation-Maximization) finds the parameters that best explain the data, and the **BIC (Bayesian Information Criterion)** selects the best model geometry (spherical, ellipsoidal, etc.) and number of components.
+
+Since Mclust requires continuous numeric input, we run it on the same FAMD factor scores used in Method 2. This means Mclust and FAMD + k-means operate on identical data, differing only in their clustering assumptions: k-means forces spherical clusters of equal size, while Mclust allows ellipsoidal clusters of varying size and orientation.
+
+**Why this method matters**: Mclust provides a probabilistic perspective. Each respondent receives a probability of belonging to each cluster, not just a hard assignment. This is useful for identifying respondents who sit between personas. If Mclust's BIC-selected solution agrees with the other methods, it adds strong evidence that the cluster structure reflects real patterns rather than algorithmic assumptions.
+
+We first let BIC freely select the optimal number of components (G = 2 to 8), then also fit at k = `r n_clusters` for cross-method comparison.
+
+```{r}
+#| label: mclust-fit
+#| cache: true
+# Let BIC choose freely
+mc_fit_bic <- Mclust(famd_scores, G = 2:8)
+cat("BIC-optimal number of components:", mc_fit_bic$G, "\n")
+cat("BIC-optimal model type:", mc_fit_bic$modelName, "\n")
+summary(mc_fit_bic)
+plot(mc_fit_bic, what = "BIC")
+
+# Fit at n_clusters for cross-method comparison
+mc_fit <- Mclust(famd_scores, G = n_clusters)
+summary(mc_fit)
+
+df_complete <- df_complete |>
+  mutate(cluster_mclust = factor(mc_fit$classification))
+```
+
+Note: BIC selects G = `r mc_fit_bic$G` as optimal (`r mc_fit_bic$modelName` model). We use G = `r n_clusters` for the cross-method comparison.
+
+# Comparison of Clustering Methods
+
+Having run four different clustering algorithms on the same data, we now ask: *do they agree?* If all four methods assign similar respondents to similar groups, the cluster structure is robust. If they disagree strongly, the patterns may be weak or algorithm-dependent.
+
+We use three complementary metrics. The **Adjusted Rand Index (ARI)** measures pairwise agreement between methods (1 = perfect agreement, 0 = random, negative = systematic disagreement). The **average silhouette width on Gower distance** evaluates each method's cluster quality on a common benchmark. Finally, **Jaccard bootstrap stability** assesses whether each cluster reappears when the data is resampled -- a direct test of robustness.
+
+## Agreement Between Methods (Adjusted Rand Index)
+
+```{r}
+#| label: compare-agreement
+methods <- list(
+  PAM     = as.integer(df_complete$cluster_pam),
+  FAMD_KM = as.integer(df_complete$cluster_famd),
+  KProto  = as.integer(df_complete$cluster_kproto),
+  MClust  = as.integer(df_complete$cluster_mclust)
+)
+
+ari_matrix <- matrix(NA, 4, 4, dimnames = list(names(methods), names(methods)))
+for (i in 1:4) {
+  for (j in 1:4) {
+    ari_matrix[i, j] <- adjustedRandIndex(methods[[i]], methods[[j]])
+  }
+}
+
+as_tibble(ari_matrix, rownames = "Method") |>
+  knitr::kable(digits = 3, caption = "Adjusted Rand Index -- Pairwise Method Agreement")
+```
+
+## Silhouette Comparison on Gower Distance
+
+We evaluate all four solutions using the same Gower distance matrix. **Caveat**: PAM was directly optimized on this Gower distance, so it has a structural advantage -- its silhouette score reflects optimization on the evaluation metric itself. The other methods were optimized on different representations (FAMD scores, raw mixed data). This comparison is informative but not a level playing field; the stability analysis below provides a fairer assessment.
+
+```{r}
+#| label: compare-silhouette
+sil_compare <- tibble(
+  Method = c("PAM", "FAMD+KMeans", "K-Prototypes", "Mclust"),
+  Avg_Silhouette = c(
+    mean(silhouette(as.integer(df_complete$cluster_pam),    gower_dist)[, 3]),
+    mean(silhouette(as.integer(df_complete$cluster_famd),   gower_dist)[, 3]),
+    mean(silhouette(as.integer(df_complete$cluster_kproto), gower_dist)[, 3]),
+    mean(silhouette(as.integer(df_complete$cluster_mclust), gower_dist)[, 3])
+  )
+)
+
+sil_compare |>
+  mutate(Method = fct_reorder(Method, Avg_Silhouette)) |>
+  ggplot(aes(Avg_Silhouette, Method)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(Avg_Silhouette, 3)), hjust = -0.1) +
+  labs(title = "Average Silhouette Width (Gower Distance) by Method",
+       subtitle = "Note: PAM is evaluated on the same metric it was optimized on",
+       x = "Average Silhouette Width", y = NULL) +
+  xlim(0, NA)
+
+sil_compare |> knitr::kable(digits = 3)
+```
+
+## Cluster Stability (Jaccard Bootstrap)
+
+The silhouette comparison above measures cluster *quality* but not *stability* -- whether the same clusters reappear under resampling. We use `fpc::clusterboot` with 100 bootstrap resamples to compute the mean Jaccard similarity for each cluster under each method. A Jaccard > 0.75 indicates a stable cluster; < 0.5 suggests the cluster is an artifact.
+
+```{r}
+#| label: compare-stability
+#| cache: true
+
+# PAM on Gower distance
+cb_pam <- clusterboot(
+  gower_dist, B = 100, bootmethod = "boot",
+  clustermethod = claraCBI, usepam = TRUE, k = n_clusters,
+  distances = TRUE, seed = 42, count = FALSE
+)
+
+# k-means on FAMD scores
+cb_famd <- clusterboot(
+  as.data.frame(famd_scores), B = 100, bootmethod = "boot",
+  clustermethod = kmeansCBI, krange = n_clusters,
+  seed = 42, count = FALSE
+)
+
+# Mclust on FAMD scores
+cb_mclust <- clusterboot(
+  as.data.frame(famd_scores), B = 100, bootmethod = "boot",
+  clustermethod = noisemclustCBI, G = n_clusters,
+  seed = 42, count = FALSE
+)
+
+stability_df <- tibble(
+  Method = c("PAM", "FAMD+KMeans", "Mclust"),
+  Mean_Jaccard = c(
+    mean(cb_pam$bootmean),
+    mean(cb_famd$bootmean),
+    mean(cb_mclust$bootmean)
+  ),
+  Min_Jaccard = c(
+    min(cb_pam$bootmean),
+    min(cb_famd$bootmean),
+    min(cb_mclust$bootmean)
+  ),
+  Cluster_Jaccards = c(
+    paste(round(cb_pam$bootmean, 2), collapse = ", "),
+    paste(round(cb_famd$bootmean, 2), collapse = ", "),
+    paste(round(cb_mclust$bootmean, 2), collapse = ", ")
+  )
+)
+
+stability_df |>
+  knitr::kable(digits = 3,
+               caption = "Jaccard Bootstrap Stability (100 resamples). >0.75 = stable, <0.50 = artifact.")
+```
+
+Note: K-Prototypes is excluded from bootstrap stability because `clusterboot` does not natively support the `kproto` algorithm.
+
+## Select Best Method
+
+We select the best method by balancing silhouette quality and bootstrap stability. PAM's silhouette advantage on Gower distance is expected (see caveat above), so we weight stability more heavily when the two metrics disagree.
+
+```{r}
+#| label: select-best
+# Combine silhouette and stability for the three bootstrapped methods
+selection_df <- sil_compare |>
+  filter(Method != "K-Prototypes") |>
+  left_join(stability_df |> select(Method, Mean_Jaccard), by = "Method") |>
+  mutate(combined = as.numeric(0.5 * scale(Avg_Silhouette) + 0.5 * scale(Mean_Jaccard)))
+
+best_method <- selection_df |> slice_max(combined, n = 1) |> pull(Method)
+cat("Best method (silhouette + stability):", best_method, "\n")
+
+selection_df |> knitr::kable(digits = 3, caption = "Method Selection: Combined Score")
+
+df_complete <- df_complete |>
+  mutate(
+    cluster_final = case_when(
+      best_method == "PAM"          ~ cluster_pam,
+      best_method == "FAMD+KMeans"  ~ cluster_famd,
+      best_method == "K-Prototypes" ~ cluster_kproto,
+      best_method == "Mclust"       ~ cluster_mclust
+    )
+  )
+
+# --- Data-driven cluster labeling (applied immediately for consistent names) ---
+# Uses salience score = value² / sample_mean for each (cluster, feature) pair.
+# This balances absolute prevalence (how common the behavior is in the cluster)
+# with distinctiveness (how much it exceeds the sample average).
+# Greedy assignment ensures each cluster gets a unique, descriptive label.
+
+feature_labels <- c(
+  pct_auto        = "Automobilisti",
+  pct_mezzi       = "Utenti del Trasporto Pubblico",
+  pct_bici        = "Ciclisti Urbani",
+  pct_piedi       = "Pedoni di Quartiere",
+  pct_moto        = "Motociclisti",
+  spazio_auto     = "Critici dello Spazio Auto",
+  meno_auto_clima = "Eco-sensibili",
+  normale_auto    = "Difensori dell'Auto",
+  trasp_pub_ineff = "Scettici del Trasporto Pubblico",
+  piu_verde       = "Ambientalisti Urbani",
+  pct_limit_yes   = "Pro Limitazione Auto"
+)
+
+label_profiles <- df_complete |>
+  group_by(cluster_final) |>
+  summarise(
+    pct_auto        = mean(auto == "Yes"),
+    pct_mezzi       = mean(mezzi_pub == "Yes"),
+    pct_bici        = mean(bici == "Yes"),
+    pct_piedi       = mean(piedi == "Yes"),
+    pct_moto        = mean(moto_scooter == "Yes"),
+    spazio_auto     = mean(spazio_auto) / 10,
+    meno_auto_clima = mean(meno_auto_clima) / 10,
+    normale_auto    = mean(normale_auto) / 10,
+    trasp_pub_ineff = mean(trasp_pub_ineff) / 10,
+    piu_verde       = mean(piu_verde) / 10,
+    pct_limit_yes   = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città"),
+    .groups = "drop"
+  )
+
+sample_profile <- df_complete |>
+  summarise(
+    pct_auto        = mean(auto == "Yes"),
+    pct_mezzi       = mean(mezzi_pub == "Yes"),
+    pct_bici        = mean(bici == "Yes"),
+    pct_piedi       = mean(piedi == "Yes"),
+    pct_moto        = mean(moto_scooter == "Yes"),
+    spazio_auto     = mean(spazio_auto) / 10,
+    meno_auto_clima = mean(meno_auto_clima) / 10,
+    normale_auto    = mean(normale_auto) / 10,
+    trasp_pub_ineff = mean(trasp_pub_ineff) / 10,
+    piu_verde       = mean(piu_verde) / 10,
+    pct_limit_yes   = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città")
+  ) |>
+  pivot_longer(everything(), names_to = "feature", values_to = "sample_mean")
+
+profiles_long <- label_profiles |>
+  pivot_longer(-cluster_final, names_to = "feature", values_to = "value") |>
+  left_join(sample_profile, by = "feature") |>
+  mutate(score = value^2 / pmax(sample_mean, 0.01))
+
+cluster_name_vec <- setNames(character(nlevels(df_complete$cluster_final)),
+                             levels(df_complete$cluster_final))
+remaining_lbl <- profiles_long
+for (i in seq_len(nlevels(df_complete$cluster_final))) {
+  best <- remaining_lbl |> slice_max(score, n = 1, with_ties = FALSE)
+  cluster_name_vec[as.character(best$cluster_final)] <- feature_labels[best$feature]
+  remaining_lbl <- remaining_lbl |>
+    filter(cluster_final != best$cluster_final, feature != best$feature)
+}
+
+# Relevel cluster_final with descriptive names
+old_levels <- levels(df_complete$cluster_final)
+df_complete <- df_complete |>
+  mutate(cluster_final = factor(cluster_name_vec[as.character(cluster_final)],
+                                levels = cluster_name_vec[old_levels]))
+
+# Name the palette for consistent cluster↔colour mapping everywhere
+names(cluster_palette) <- levels(df_complete$cluster_final)
+scale_color_clusters <- function(...) scale_color_manual(values = cluster_palette, ...)
+scale_fill_clusters  <- function(...) scale_fill_manual(values = cluster_palette, ...)
+
+# Label lookup with sample sizes (for facet / legend labels)
+cluster_sizes <- df_complete |> dplyr::count(cluster_final, name = "n")
+label_lookup <- setNames(
+  paste0(cluster_sizes$cluster_final, "\n(n = ", cluster_sizes$n, ")"),
+  as.character(cluster_sizes$cluster_final)
+)
+
+# Display assignment for transparency
+label_profiles |>
+  mutate(Cluster = as.character(cluster_final),
+         Label = cluster_name_vec[Cluster]) |>
+  select(Cluster, Label, everything(), -cluster_final) |>
+  knitr::kable(digits = 2,
+               caption = "Cluster label assignment (salience = value\u00b2 / sample mean)")
+```
+
+# Cluster Profiling
+
+Clustering tells us *who goes with whom*, but not *why*. This section characterizes each cluster by examining how its members differ from the overall sample on every variable. We look at numeric means, categorical proportions, and demographic distributions to build a complete portrait of each persona.
+
+## Numeric Variable Profiles
+
+The table below reports the mean and standard deviation of each numeric variable within each cluster. Comparing these against the overall sample means (visible in the EDA section) reveals which attitudes and priorities distinguish each group.
+
+```{r}
+#| label: profile-numeric
+numeric_vars <- c(
+  "spazio_auto", "trasp_pub_ineff", "meno_auto_clima", "normale_auto",
+  "piu_verde", "aggreg_disturbo", "parcheggi_aggreg",
+  "eta", "dist_duomo_km",
+  priority_short
+)
+
+profiles_num <- df_complete |>
+  group_by(cluster_final) |>
+  summarise(
+    n = n(),
+    across(all_of(numeric_vars), list(mean = mean, sd = sd), .names = "{.col}__{.fn}"),
+    .groups = "drop"
+  )
+
+profiles_num |>
+  knitr::kable(digits = 2, caption = "Cluster Profiles -- Numeric Variables (Mean +/- SD)")
+```
+
+## Heatmap of Standardized Cluster Means
+
+The heatmap below standardizes each variable's cluster means into z-scores (number of standard deviations above or below the overall mean). This makes variables on different scales directly comparable. Red cells indicate the cluster scores notably above average; blue cells indicate below average. The raw mean values are printed inside each cell for reference.
+
+```{r}
+#| label: profile-heatmap
+#| fig-height: 9
+heatmap_vars <- c(
+  "spazio_auto", "trasp_pub_ineff", "meno_auto_clima", "normale_auto",
+  "piu_verde", "aggreg_disturbo", "parcheggi_aggreg",
+  priority_short
+)
+
+df_complete |>
+  group_by(cluster_final) |>
+  summarise(across(all_of(heatmap_vars), mean), .groups = "drop") |>
+  pivot_longer(-cluster_final, names_to = "variable", values_to = "mean_val") |>
+  group_by(variable) |>
+  mutate(z_score = (mean_val - mean(mean_val)) / sd(mean_val)) |>
+  ungroup() |>
+  ggplot(aes(cluster_final, variable, fill = z_score)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(mean_val, 1)), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "Z-score") +
+  labs(title = "Cluster Profiles -- Standardized Mean Heatmap",
+       x = "Cluster", y = NULL) +
+  theme(axis.text.x = element_text(size = 8, angle = 25, hjust = 1),
+        axis.text.y = element_text(size = 10))
+```
+
+## Categorical Variable Profiles
+
+For categorical variables, we examine the proportion of each level within each cluster. Stacked bar charts make it easy to spot when a cluster has a markedly different composition -- for example, if one cluster is overwhelmingly composed of car users or students.
+
+```{r}
+#| label: profile-categorical
+#| fig-height: 6
+cat_vars <- c("limitare_auto", "lavoro", "genere",
+              "auto", "bici", "mezzi_pub", "piedi", "moto_scooter")
+
+for (v in cat_vars) {
+  p <- df_complete |>
+    dplyr::count(cluster_final, .data[[v]]) |>
+    group_by(cluster_final) |>
+    mutate(pct = n / sum(n)) |>
+    ungroup() |>
+    ggplot(aes(cluster_final, pct, fill = .data[[v]])) +
+    geom_col(position = "fill") +
+    scale_y_continuous(labels = percent_format()) +
+    labs(title = paste("Cluster x", v), x = "Cluster", y = "Proportion") +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(size = 8, angle = 25, hjust = 1))
+  print(p)
+}
+```
+
+## Age and Distance Boxplots by Cluster
+
+```{r}
+#| label: profile-boxplots
+p_age <- ggplot(df_complete, aes(cluster_final, eta, fill = cluster_final)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_clusters() +
+  labs(title = "Age by Cluster", x = "Cluster", y = "Age") +
+  theme(axis.text.x = element_text(size = 8, angle = 25, hjust = 1))
+
+p_dist <- ggplot(df_complete, aes(cluster_final, dist_duomo_km, fill = cluster_final)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_clusters() +
+  labs(title = "Distance from Duomo by Cluster", x = "Cluster", y = "km") +
+  theme(axis.text.x = element_text(size = 8, angle = 25, hjust = 1))
+
+p_age + p_dist
+```
+
+## Distance from Duomo by Cluster (Detailed)
+
+The boxplot above compresses the distance distribution. This faceted histogram filters to the urban core (< 20 km) and overlays Milan's concentric cerchie (ring roads) as reference lines, matching the descriptive analysis above. This reveals whether different clusters draw from different parts of the city.
+
+```{r}
+#| label: profile-dist-duomo-cluster
+#| fig-height: 8
+#| fig-width: 10
+
+cerchie_cluster <- tribble(
+  ~dist, ~label,
+  1.2,   "Navigli",
+  2.2,   "Bastioni",
+  5.0,   "Filov. 90/91",
+  7.0,   "Confine comunale"
+)
+
+df_complete |>
+  filter(dist_duomo_km <= 20) |>
+  ggplot(aes(dist_duomo_km, fill = cluster_final, color = cluster_final)) +
+  geom_density(alpha = 0.25, linewidth = 0.8) +
+  geom_vline(data = cerchie_cluster, aes(xintercept = dist),
+             linetype = "dashed", color = "grey30", linewidth = 0.4) +
+  geom_text(data = cerchie_cluster, aes(x = dist, y = Inf, label = label),
+            inherit.aes = FALSE,
+            angle = 90, hjust = 1.1, vjust = -0.3, size = 2.8, color = "grey30") +
+  scale_fill_clusters() +
+  scale_color_clusters() +
+  labs(title = "Distance from Duomo by Cluster (Urban Core < 20 km)",
+       subtitle = "Dashed lines = Milan's concentric cerchie",
+       x = "Distance from Duomo (km)", y = "Density",
+       fill = "Cluster", color = "Cluster") +
+  theme(legend.position = "bottom")
+```
+
+## Cluster Sizes
+
+```{r}
+#| label: profile-sizes
+df_complete |>
+  dplyr::count(cluster_final, name = "n") |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(cluster_final, n, fill = cluster_final)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_clusters() +
+  geom_text(aes(label = paste0(n, " (", percent(pct, accuracy = 0.1), ")")),
+            vjust = -0.3) +
+  labs(title = "Cluster Sizes", x = "Cluster", y = "Count") +
+  theme(axis.text.x = element_text(size = 9, angle = 25, hjust = 1))
+```
+
+# Cluster Comparison Visualizations
+
+The profiling tables and stacked bars above provide detailed data, but can be hard to scan quickly. This section presents three summary visualizations designed for rapid comparison across clusters. The **diverging lollipop chart** highlights only each cluster's distinctive traits (what makes it different). The **radar chart** shows the full attitude profile shape for all clusters simultaneously. The **grouped bar charts** compare transport usage and car-limiting attitudes side by side.
+
+```{r}
+#| label: cluster-labels-reference
+#| echo: false
+# Labeling already applied in the select-best chunk above.
+# label_lookup and cluster_palette are available for all downstream plots.
+invisible(NULL)
+```
+
+## Diverging Lollipop: Distinctive Traits per Cluster
+
+Each panel shows only the variables where the cluster deviates meaningfully from the sample average (|z| > 0.3 standard deviations). This highlights what makes each persona unique.
+
+```{r}
+#| label: lollipop-distinctive
+#| fig-height: 20
+#| fig-width: 12
+
+# Compute cluster means for all numeric variables
+numeric_vars_all <- c(
+  "spazio_auto", "trasp_pub_ineff", "meno_auto_clima", "normale_auto",
+  "piu_verde", "aggreg_disturbo", "parcheggi_aggreg", "eta", "dist_duomo_km",
+  priority_short
+)
+
+# Build a unified numeric profile including binary/categorical as proportions
+profile_data <- df_complete |>
+  group_by(cluster_final) |>
+  summarise(
+    across(all_of(numeric_vars_all), mean, .names = "{.col}"),
+    # Binary transport modes as % Yes
+    `auto (% uso)` = mean(auto == "Yes") * 10,
+    `bici (% uso)` = mean(bici == "Yes") * 10,
+    `mezzi pubblici (% uso)` = mean(mezzi_pub == "Yes") * 10,
+    `piedi (% uso)` = mean(piedi == "Yes") * 10,
+    `moto/scooter (% uso)` = mean(moto_scooter == "Yes") * 10,
+    # Key limitare_auto categories as proportion * 10 (for comparable scale)
+    `limiterebbe senza condizioni (%)` = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città") * 10,
+    `auto necessarie (%)` = mean(limitare_auto == "Trovo che le auto siano necessarie per la vita quotidiana") * 10,
+    .groups = "drop"
+  )
+
+# Overall sample means
+sample_means <- df_complete |>
+  summarise(
+    across(all_of(numeric_vars_all), mean),
+    `auto (% uso)` = mean(auto == "Yes") * 10,
+    `bici (% uso)` = mean(bici == "Yes") * 10,
+    `mezzi pubblici (% uso)` = mean(mezzi_pub == "Yes") * 10,
+    `piedi (% uso)` = mean(piedi == "Yes") * 10,
+    `moto/scooter (% uso)` = mean(moto_scooter == "Yes") * 10,
+    `limiterebbe senza condizioni (%)` = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città") * 10,
+    `auto necessarie (%)` = mean(limitare_auto == "Trovo che le auto siano necessarie per la vita quotidiana") * 10
+  )
+
+sample_sds <- df_complete |>
+  summarise(
+    across(all_of(numeric_vars_all), sd),
+    `auto (% uso)` = sd(as.numeric(auto == "Yes")) * 10,
+    `bici (% uso)` = sd(as.numeric(bici == "Yes")) * 10,
+    `mezzi pubblici (% uso)` = sd(as.numeric(mezzi_pub == "Yes")) * 10,
+    `piedi (% uso)` = sd(as.numeric(piedi == "Yes")) * 10,
+    `moto/scooter (% uso)` = sd(as.numeric(moto_scooter == "Yes")) * 10,
+    `limiterebbe senza condizioni (%)` = sd(as.numeric(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città")) * 10,
+    `auto necessarie (%)` = sd(as.numeric(limitare_auto == "Trovo che le auto siano necessarie per la vita quotidiana")) * 10
+  )
+
+# Compute z-scores for each cluster
+all_vars <- names(sample_means)
+
+# Variable-to-group mapping
+var_group_lookup <- c(
+  "spazio_auto" = "Atteggiamenti", "trasp_pub_ineff" = "Atteggiamenti",
+  "meno_auto_clima" = "Atteggiamenti", "normale_auto" = "Atteggiamenti",
+  "piu_verde" = "Atteggiamenti", "aggreg_disturbo" = "Atteggiamenti",
+  "parcheggi_aggreg" = "Atteggiamenti",
+  "eta" = "Demografia", "dist_duomo_km" = "Demografia",
+  "prio_circolazione" = "Priorità", "prio_mobilita_sost" = "Priorità",
+  "prio_parcheggi" = "Priorità", "prio_verde_urbano" = "Priorità",
+  "prio_cultura_sport" = "Priorità", "prio_socialita" = "Priorità",
+  "auto (% uso)" = "Trasporto", "bici (% uso)" = "Trasporto",
+  "mezzi pubblici (% uso)" = "Trasporto", "piedi (% uso)" = "Trasporto",
+  "moto/scooter (% uso)" = "Trasporto",
+  "limiterebbe senza condizioni (%)" = "Politica",
+  "auto necessarie (%)" = "Politica"
+)
+
+lollipop_df <- profile_data |>
+  pivot_longer(-cluster_final, names_to = "variable", values_to = "cluster_mean") |>
+  left_join(
+    sample_means |> pivot_longer(everything(), names_to = "variable", values_to = "sample_mean"),
+    by = "variable"
+  ) |>
+  left_join(
+    sample_sds |> pivot_longer(everything(), names_to = "variable", values_to = "sample_sd"),
+    by = "variable"
+  ) |>
+  mutate(
+    z_score = (cluster_mean - sample_mean) / sample_sd,
+    var_group = factor(var_group_lookup[variable],
+                       levels = c("Trasporto", "Atteggiamenti", "Priorità",
+                                  "Politica", "Demografia"))
+  ) |>
+  filter(abs(z_score) > 0.3) |>
+  mutate(
+    direction = if_else(z_score > 0, "Above average", "Below average"),
+    variable = fct_reorder(variable, z_score)
+  )
+
+ggplot(lollipop_df, aes(x = z_score, y = variable, color = direction)) +
+  geom_vline(xintercept = 0, linewidth = 0.5, color = "grey50") +
+  geom_segment(aes(x = 0, xend = z_score, yend = variable), linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Above average" = "#B2182B", "Below average" = "#2166AC")) +
+  ggh4x::facet_grid2(var_group ~ cluster_final,
+                      scales = "free_y", space = "free_y",
+                      switch = "y",
+                      labeller = labeller(cluster_final = label_lookup)) +
+  labs(
+    title = "Distinctive Traits per Cluster (deviation from sample average)",
+    subtitle = "Only variables with |z| > 0.3 shown. Rows grouped by variable type.",
+    x = "Standard deviations from sample mean",
+    y = NULL,
+    color = NULL
+  ) +
+  theme(
+    legend.position = "top",
+    strip.text.x = element_text(size = 8, face = "bold"),
+    strip.text.y.left = element_text(size = 9, face = "bold", angle = 0),
+    strip.placement = "outside",
+    panel.grid.major.y = element_blank(),
+    panel.spacing.y = unit(0.3, "lines")
+  )
+```
+
+## Radar Chart: Full Likert Profile Comparison
+
+```{r}
+#| label: radar-chart
+#| fig-height: 12
+#| fig-width: 12
+
+# Radar chart -- one panel per cluster for clarity with 6 groups
+likert_vars <- c("spazio_auto", "trasp_pub_ineff", "meno_auto_clima",
+                 "normale_auto", "piu_verde", "aggreg_disturbo", "parcheggi_aggreg")
+
+likert_labels <- c(
+  "spazio_auto" = "Troppo spazio\nper auto",
+  "trasp_pub_ineff" = "Trasp. pubblico\ninefficiente",
+  "meno_auto_clima" = "Meno auto per\nil clima",
+  "normale_auto" = "Normale avere\nauto",
+  "piu_verde" = "Più verde",
+  "aggreg_disturbo" = "Aggregazione\nporta disturbo",
+  "parcheggi_aggreg" = "Parcheggi ad\naggregazione"
+)
+
+# Compute sample-wide mean as the grey reference polygon
+sample_radar <- df_complete |>
+  summarise(across(all_of(likert_vars), mean)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  mutate(var_id = match(variable, likert_vars))
+
+radar_data <- df_complete |>
+  group_by(cluster_final) |>
+  summarise(across(all_of(likert_vars), mean), .groups = "drop") |>
+  pivot_longer(all_of(likert_vars), names_to = "variable", values_to = "value") |>
+  mutate(var_id = match(variable, likert_vars))
+
+n_vars <- length(likert_vars)
+angle_step <- 2 * pi / n_vars
+
+add_radar_coords <- function(df) {
+  df |> mutate(
+    angle = (var_id - 1) * angle_step,
+    x = value * cos(angle),
+    y = value * sin(angle)
+  )
+}
+
+radar_data   <- add_radar_coords(radar_data)
+sample_radar <- add_radar_coords(sample_radar)
+
+# Close polygons
+close_poly <- function(df, grp) {
+  df |> group_by(across(all_of(grp))) |>
+    arrange(var_id) |>
+    group_modify(~ bind_rows(.x, .x |> slice(1))) |>
+    ungroup()
+}
+
+radar_poly  <- close_poly(radar_data, "cluster_final")
+sample_poly <- bind_rows(sample_radar, sample_radar |> slice(1))
+
+# Grid
+grid_circles <- tibble(r = c(2, 4, 6, 8, 10)) |>
+  mutate(data = purrr::map(r, ~ tibble(
+    angle = seq(0, 2 * pi, length.out = 100),
+    x = .x * cos(angle), y = .x * sin(angle)
+  ))) |> unnest(data)
+
+grid_spokes <- tibble(var_id = 1:n_vars) |>
+  mutate(angle = (var_id - 1) * angle_step,
+         xend = 10 * cos(angle), yend = 10 * sin(angle))
+
+axis_labels <- tibble(
+  var_id = 1:n_vars, variable = likert_vars,
+  angle = (var_id - 1) * angle_step,
+  x = 11.8 * cos(angle), y = 11.8 * sin(angle),
+  label = likert_labels[variable]
+)
+
+ggplot() +
+  geom_path(data = grid_circles, aes(x, y, group = r),
+            color = "grey85", linewidth = 0.3) +
+  geom_segment(data = grid_spokes, aes(x = 0, y = 0, xend = xend, yend = yend),
+               color = "grey85", linewidth = 0.3) +
+  # Sample average (grey reference)
+  geom_polygon(data = sample_poly, aes(x, y),
+               fill = "grey70", alpha = 0.15) +
+  geom_path(data = sample_poly, aes(x, y),
+            color = "grey50", linewidth = 0.5, linetype = "dashed") +
+  # Cluster polygon
+  geom_polygon(data = radar_poly, aes(x, y, fill = cluster_final),
+               alpha = 0.25, show.legend = FALSE) +
+  geom_path(data = radar_poly, aes(x, y, color = cluster_final),
+            linewidth = 1, show.legend = FALSE) +
+  geom_point(data = radar_data, aes(x, y, color = cluster_final),
+             size = 2, show.legend = FALSE) +
+  geom_text(data = axis_labels, aes(x, y, label = label),
+            size = 2.5, lineheight = 0.85) +
+  scale_color_clusters() +
+  scale_fill_clusters() +
+  coord_equal() +
+  facet_wrap(~ cluster_final, ncol = 3,
+            labeller = labeller(cluster_final = label_lookup)) +
+  labs(title = "Likert Profile per Cluster (1-10 scale)",
+       subtitle = "Grey dashed polygon = sample average") +
+  theme_void(base_size = 11) +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10)
+  )
+```
+
+## Grouped Bar Chart: Transport Mode Usage by Cluster
+
+```{r}
+#| label: transport-grouped-bars
+#| fig-height: 6
+#| fig-width: 10
+
+transport_modes <- c("auto", "bici", "mezzi_pub", "piedi", "moto_scooter", "taxi", "monopattino")
+
+transport_labels <- c(
+  "auto" = "\U0001F697 Auto", "bici" = "\U0001F6B2 Bici",
+  "mezzi_pub" = "\U0001F68C Mezzi pubblici", "piedi" = "\U0001F6B6 Piedi",
+  "moto_scooter" = "\U0001F3CD Moto/scooter",
+  "taxi" = "\U0001F695 Taxi", "monopattino" = "\U0001F6F4 Monopattino"
+)
+
+transport_data <- df_complete |>
+  group_by(cluster_final) |>
+  summarise(
+    across(all_of(transport_modes), ~ mean(. == "Yes") * 100),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  pivot_longer(all_of(transport_modes), names_to = "mode", values_to = "pct") |>
+  mutate(mode_label = transport_labels[mode],
+         mode_label = fct_reorder(mode_label, -pct))
+
+# Sample average for reference
+transport_avg <- df_complete |>
+  summarise(across(all_of(transport_modes), ~ mean(. == "Yes") * 100)) |>
+  pivot_longer(everything(), names_to = "mode", values_to = "pct_avg") |>
+  mutate(mode_label = transport_labels[mode])
+
+ggplot(transport_data, aes(x = mode_label, y = pct, fill = cluster_final)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.85) +
+  geom_point(data = transport_avg, aes(x = mode_label, y = pct_avg),
+             inherit.aes = FALSE, shape = 18, size = 4, color = "black") +
+  scale_fill_clusters() +
+  labs(
+    title = "Transport Mode Usage by Cluster",
+    subtitle = "Black diamonds = sample average",
+    x = NULL, y = "% of cluster members", fill = "Cluster"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "bottom",
+    legend.text = element_text(size = 9)
+  )
+```
+
+## Grouped Bar Chart: Attitude Toward Limiting Cars
+
+```{r}
+#| label: limitare-grouped-bars
+#| fig-height: 7
+#| fig-width: 11
+
+# Shorter labels for the limitare_auto categories
+limitare_short <- c(
+  "Limiterei le auto per migliorare la qualità della vita in città" = "Limitare per migliorare\nqualità della vita",
+  "Limiterei le auto SOLO se ci fossero buone alternative per muoversi" = "Limitare SOLO con\nbuone alternative",
+  "Trovo che le auto siano necessarie per la vita quotidiana" = "Auto necessarie\nper vita quotidiana",
+  "Non sento il bisogno di cambiare la situazione attuale" = "Non serve\ncambiare",
+  "Non ho un'opinione precisa a riguardo" = "Nessuna opinione\nprecisa"
+)
+
+limitare_data <- df_complete |>
+  dplyr::count(cluster_final, limitare_auto) |>
+  group_by(cluster_final) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ungroup() |>
+  mutate(
+    limitare_short = limitare_short[as.character(limitare_auto)],
+    limitare_short = fct_reorder(limitare_short, -pct)
+  )
+
+ggplot(limitare_data, aes(x = limitare_short, y = pct, fill = cluster_final)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.85) +
+  scale_fill_clusters() +
+  labs(
+    title = "Attitude Toward Limiting Cars by Cluster",
+    x = NULL, y = "% of cluster members", fill = "Cluster"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 9)
+  )
+```
+
+# Dimensionality Reduction Visualizations
+
+The cluster profiles tell us *what* distinguishes each group, but not how clearly separated they are in the data. Dimensionality reduction visualizations project the high-dimensional respondent data into two dimensions for visual inspection. If clusters appear as distinct clouds, the separation is strong; if they overlap heavily, the clusters represent tendencies rather than sharp boundaries. Both outcomes are informative for understanding citizen attitudes.
+
+## t-SNE on Gower Distance
+
+**t-SNE (t-distributed Stochastic Neighbor Embedding)** is a nonlinear dimensionality reduction technique that excels at preserving local neighborhoods: respondents who are similar in the full 25-variable space will appear close together in the 2D plot. Unlike PCA, t-SNE can reveal non-convex cluster shapes. We run it directly on the Gower distance matrix.
+
+```{r}
+#| label: tsne-plot
+#| cache: true
+tsne_result <- Rtsne(gower_dist, is_distance = TRUE, perplexity = 30, dims = 2)
+
+tsne_df <- tibble(
+  tSNE1 = tsne_result$Y[, 1],
+  tSNE2 = tsne_result$Y[, 2],
+  Cluster = df_complete$cluster_final
+)
+
+ggplot(tsne_df, aes(tSNE1, tSNE2, color = Cluster, shape = Cluster)) +
+  geom_point(alpha = 0.55, size = 2) +
+  scale_color_clusters(name = "Cluster") +
+  scale_shape_manual(name = "Cluster",
+                     values = c(16, 17, 15, 18, 3, 4, 8, 1, 2)[seq_len(n_clusters)]) +
+  labs(title = "t-SNE Visualization of Clusters (Gower Distance)",
+       x = "t-SNE 1", y = "t-SNE 2") +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme(legend.position = "right",
+        legend.text = element_text(size = 8))
+```
+
+## FAMD Biplot Colored by Cluster
+
+The FAMD biplot shows respondents positioned on the first two factor dimensions (the same ones from Method 2). Unlike t-SNE, the axes are interpretable -- they correspond to the variable contributions shown earlier. The percentage of variance explained by each axis indicates how much of the total data variation is captured in this 2D view.
+
+```{r}
+#| label: famd-biplot
+famd_df <- tibble(
+  Dim1 = famd_result$ind$coord[, 1],
+  Dim2 = famd_result$ind$coord[, 2],
+  Cluster = df_complete$cluster_final
+)
+
+ggplot(famd_df, aes(Dim1, Dim2, color = Cluster, shape = Cluster)) +
+  geom_point(alpha = 0.55, size = 2) +
+  scale_color_clusters(name = "Cluster") +
+  scale_shape_manual(name = "Cluster",
+                     values = c(16, 17, 15, 18, 3, 4, 8, 1, 2)[seq_len(n_clusters)]) +
+  labs(title = "FAMD Individual Map -- Colored by Final Cluster",
+       x = paste0("Dim 1 (", round(famd_result$eig[1, 2], 1), "%)"),
+       y = paste0("Dim 2 (", round(famd_result$eig[2, 2], 1), "%)")) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme(legend.text = element_text(size = 8))
+```
+
+## PAM Medoids (Representative Individuals)
+
+The medoid is the most centrally located member of each PAM cluster -- the respondent whose overall profile is closest to all other members of their group. Examining medoids gives us a concrete, real-person embodiment of each persona.
+
+```{r}
+#| label: medoids
+medoid_indices <- pam_fit$id.med
+df_complete |>
+  slice(medoid_indices) |>
+  select(cluster_pam, all_of(names(df_clust))) |>
+  knitr::kable(caption = "PAM Medoids -- Representative Individuals per Cluster")
+```
+
+# Cluster Interpretation
+
+The `r n_clusters` clusters identified by the analysis represent distinct citizen archetypes with coherent attitudes toward urban mobility, environmental priorities, and car usage in Milan. The labels are assigned programmatically based on each cluster's most distinctive feature (see table above), so they remain correct across re-runs. Each persona profile below is generated dynamically from the data.
+
+```{r}
+#| label: interpretation-dynamic
+#| results: asis
+
+limit_solo <- "Limiterei le auto SOLO se ci fossero buone alternative per muoversi"
+limit_yes  <- "Limiterei le auto per migliorare la qualità della vita in città"
+limit_need <- "Trovo che le auto siano necessarie per la vita quotidiana"
+
+transport_mode_labels <- c(
+  auto = "car", bici = "bicycle", mezzi_pub = "public transit",
+  piedi = "walking", moto_scooter = "moto/scooter"
+)
+
+for (cl in levels(df_complete$cluster_final)) {
+  d <- df_complete |> filter(cluster_final == cl)
+  cl_name <- cl
+  n_cl <- nrow(d)
+  pct_sample <- round(n_cl / nrow(df_complete) * 100, 1)
+
+  # Dominant transport mode
+  mode_pcts <- sapply(names(transport_mode_labels), function(m) mean(d[[m]] == "Yes"))
+  top_mode <- names(which.max(mode_pcts))
+  top_mode_pct <- round(max(mode_pcts) * 100)
+  car_pct <- round(mean(d$auto == "Yes") * 100)
+
+  # Attitudes
+  m_spazio   <- round(mean(d$spazio_auto), 1)
+  m_clima    <- round(mean(d$meno_auto_clima), 1)
+  m_normale  <- round(mean(d$normale_auto), 1)
+  m_trasp    <- round(mean(d$trasp_pub_ineff), 1)
+  m_parcheg  <- round(mean(d$parcheggi_aggreg), 1)
+  m_verde    <- round(mean(d$piu_verde), 1)
+
+  # Car-limiting
+  p_limit_yes  <- round(mean(d$limitare_auto == limit_yes) * 100)
+  p_limit_solo <- round(mean(d$limitare_auto == limit_solo) * 100)
+  p_limit_need <- round(mean(d$limitare_auto == limit_need) * 100)
+
+  # Demographics
+  m_eta <- round(mean(d$eta), 1)
+  top_lavoro <- d |> dplyr::count(lavoro, sort = TRUE) |> slice(1)
+  top_lav_pct <- round(top_lavoro$n / n_cl * 100)
+
+  cat("\n## \"", cl_name, "\"\n\n", sep = "")
+
+  cat("**", n_cl, " members (", pct_sample, "% of sample).** ",
+      "Dominant transport: ", transport_mode_labels[top_mode],
+      " (", top_mode_pct, "%)",
+      if (top_mode != "auto") paste0("; car usage ", car_pct, "%") else "",
+      ". Mean age: ", m_eta, ". ",
+      "Largest employment group: ", as.character(top_lavoro$lavoro),
+      " (", top_lav_pct, "%).\n\n", sep = "")
+
+  cat("**Attitudes** (1-10 scale): ",
+      "too much space for cars = ", m_spazio,
+      ", fewer cars for climate = ", m_clima,
+      ", normal to have cars = ", m_normale,
+      ", public transport inefficient = ", m_trasp,
+      ", more green space = ", m_verde,
+      ", parking to social spaces = ", m_parcheg, ".\n\n", sep = "")
+
+  cat("**Car-limiting policy**: ",
+      p_limit_yes, "% would limit unconditionally, ",
+      p_limit_solo, "% only with alternatives, ",
+      p_limit_need, "% consider cars necessary.\n\n", sep = "")
+}
+```

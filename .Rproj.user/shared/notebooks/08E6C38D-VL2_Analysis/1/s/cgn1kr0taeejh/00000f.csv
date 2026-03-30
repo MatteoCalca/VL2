@@ -1,0 +1,10 @@
+"0","#| label: eda-categorical"
+"0","#| fig-height: 10"
+"0","p1 <- df_complete |>"
+"0","  count(limitare_auto) |>"
+"0","  mutate(limitare_auto = fct_reorder(limitare_auto, n)) |>"
+"0","  ggplot(aes(n, limitare_auto)) +"
+"0","  geom_col(fill = ""steelblue"") +"
+"0","  labs(title = ""Limiting cars: improve or worsen?"", x = ""Count"", y = NULL)"
+"2","Errore in order(y) : tipo 'list' non implementato in 'orderVector1'
+"

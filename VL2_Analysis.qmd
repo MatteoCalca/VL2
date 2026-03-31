@@ -545,7 +545,7 @@ df_complete <- df_complete |>
 
 ### Silhouette Plot
 
-The per-observation silhouette plot shows how well each respondent fits their assigned cluster. Bars extending to the right indicate good fit; bars crossing zero indicate respondents who sit on the boundary between clusters. Some overlap is expected in survey data, where human attitudes do not fall into perfectly discrete boxes.
+The per-observation silhouette plot shows how well each respondent fits their assigned cluster. Bars extending to the right indicate good fit; bars crossing zero mean the respondent is actually closer to another cluster's centroid than their own — by the silhouette criterion they are "misclassified", though this is common in survey data where attitudes form a continuum rather than discrete groups. The dashed horizontal line marks the overall average silhouette width; low values (near zero) indicate substantial overlap between clusters, reflecting gradual attitude transitions rather than sharp boundaries.
 
 ```{r}
 #| label: gower-silhouette-plot
@@ -575,52 +575,67 @@ fviz_screeplot(famd_result, ncp = 10, addlabels = TRUE, barfill = "steelblue") +
 
 ### Variable Contributions
 
-The variable map shows how each original variable relates to the first two FAMD dimensions. Variables pointing in the same direction are correlated; variables at right angles are independent. The contribution bar charts show which variables drive each dimension most strongly.
+The variable maps show how each original variable relates to the FAMD dimensions. Variables pointing in the same direction are correlated; variables at right angles are independent. Dim 1--2 capture the strongest axis of variation (often age/employment vs. attitudes); Dim 3--4 reveal secondary structure that the first view misses. The per-dimension contribution bar charts below show which variables drive each dimension most strongly.
 
 ```{r}
 #| label: famd-inspect
-#| fig-height: 10
-fviz_famd_var(famd_result, repel = TRUE) +
-  labs(title = "FAMD -- Variable Map (Dim 1 vs Dim 2)")
+#| fig-height: 12
+(fviz_famd_var(famd_result, repel = TRUE, col.var = "black") +
+  labs(title = "FAMD -- Variable Map (Dim 1 vs Dim 2)")) /
+(fviz_famd_var(famd_result, axes = c(3, 4), repel = TRUE, col.var = "black") +
+  labs(title = "FAMD -- Variable Map (Dim 3 vs Dim 4)"))
 ```
 
 ```{r}
 #| label: famd-contributions
 #| fig-height: 10
 
-# Quantitative variable contributions (manual to avoid fviz_contrib color bug)
-quanti_contrib <- tibble(
-  variable = rownames(famd_result$quanti.var$contrib),
-  contrib  = (famd_result$quanti.var$contrib[, 1] + famd_result$quanti.var$contrib[, 2]) / 2
-) |>
-  mutate(variable = fct_reorder(variable, contrib))
+# Helper: per-dimension contribution charts
+make_quanti_contrib <- function(dim_idx) {
+  tibble(
+    variable = rownames(famd_result$quanti.var$contrib),
+    contrib  = famd_result$quanti.var$contrib[, dim_idx]
+  ) |>
+    mutate(variable = fct_reorder(variable, contrib)) |>
+    ggplot(aes(contrib, variable)) +
+    geom_col(fill = "steelblue") +
+    labs(title = paste("Quantitative -- Dim", dim_idx),
+         x = "Contribution (%)", y = NULL)
+}
 
-p_quanti <- ggplot(quanti_contrib, aes(contrib, variable)) +
-  geom_col(fill = "steelblue") +
-  labs(title = "Contributions of quantitative variables to Dim 1-2",
-       x = "Contribution (%)", y = NULL)
+make_quali_contrib <- function(dim_idx) {
+  tibble(
+    category = rownames(famd_result$quali.var$contrib),
+    variable = rep(names(which(sapply(df_clust, is.factor))),
+                   times = sapply(df_clust[, sapply(df_clust, is.factor)], nlevels)),
+    contrib  = famd_result$quali.var$contrib[, dim_idx]
+  ) |>
+    mutate(label = paste0(variable, ": ", str_trunc(category, 35)),
+           label = fct_reorder(label, contrib)) |>
+    ggplot(aes(contrib, label)) +
+    geom_col(fill = "darkorange") +
+    labs(title = paste("Qualitative -- Dim", dim_idx),
+         x = "Contribution (%)", y = NULL) +
+    theme(axis.text.y = element_text(size = 7))
+}
 
-# Qualitative category contributions (manual to avoid duplicate row name crash)
-quali_contrib <- tibble(
-  category = rownames(famd_result$quali.var$contrib),
-  variable = rep(names(which(sapply(df_clust, is.factor))),
-                 times = sapply(df_clust[, sapply(df_clust, is.factor)], nlevels)),
-  contrib  = (famd_result$quali.var$contrib[, 1] + famd_result$quali.var$contrib[, 2]) / 2
-) |>
-  mutate(label = paste0(variable, ": ", category),
-         label = fct_reorder(label, contrib))
+(make_quanti_contrib(1) + make_quanti_contrib(2)) /
+(make_quanti_contrib(3) + make_quanti_contrib(4))
+```
 
-p_quali <- ggplot(quali_contrib, aes(contrib, label)) +
-  geom_col(fill = "darkorange") +
-  labs(title = "Contributions of qualitative categories to Dim 1-2",
-       x = "Contribution (%)", y = NULL)
-
-p_quanti / p_quali
+```{r}
+#| label: famd-contributions-quali
+#| fig-height: 14
+#| fig-width: 14
+(make_quali_contrib(1) + make_quali_contrib(2)) /
+(make_quali_contrib(3) + make_quali_contrib(4))
 ```
 
 ### Optimal k Diagnostics
 
 We show three standard diagnostics for choosing k in k-means: the **elbow plot** (total within-cluster sum of squares -- look for the "bend"), the **silhouette** (average cluster cohesion), and the **gap statistic** (comparison to a null reference distribution). These are shown for reference; we fix k = `r n_clusters` for comparability with the other methods.
+
+The elbow plot shows a smoothly declining curve with no sharp "bend", indicating the data lacks a single dominant partition. The silhouette plot peaks at k = 2, reflecting a broad dichotomy (e.g., pro-car vs. anti-car attitudes). The gap statistic suggests a different optimal k. All three diagnostics favour fewer clusters than our chosen k = `r n_clusters`; we prefer the finer granularity because it yields policy-relevant sub-populations that a coarse split would obscure (see "Choosing k" above).
 
 ```{r}
 #| label: famd-kmeans-optk
@@ -728,7 +743,7 @@ Since Mclust requires continuous numeric input, we run it on the same FAMD facto
 
 **Why this method matters**: Mclust provides a probabilistic perspective. Each respondent receives a probability of belonging to each cluster, not just a hard assignment. This is useful for identifying respondents who sit between personas. If Mclust's BIC-selected solution agrees with the other methods, it adds strong evidence that the cluster structure reflects real patterns rather than algorithmic assumptions.
 
-We first let BIC freely select the optimal number of components (G = 2 to 8), then also fit at k = `r n_clusters` for cross-method comparison.
+Mclust's BIC provides an independent statistical estimate of k. We report it for transparency, then also fit at k = `r n_clusters` for the cross-method comparison.
 
 ```{r}
 #| label: mclust-fit
@@ -748,13 +763,13 @@ df_complete <- df_complete |>
   mutate(cluster_mclust = factor(mc_fit$classification))
 ```
 
-Note: BIC selects G = `r mc_fit_bic$G` as optimal (`r mc_fit_bic$modelName` model). We use G = `r n_clusters` for the cross-method comparison.
+Note: BIC selects G = `r mc_fit_bic$G` as optimal (`r mc_fit_bic$modelName` model), which may differ from our k = `r n_clusters` choice. See "Choosing k" above for rationale. We fit at k = `r n_clusters` for the cross-method comparison.
 
-# Comparison of Clustering Methods
+# Robustness Check: Cross-Method Agreement
 
-Having run four different clustering algorithms on the same data, we now ask: *do they agree?* If all four methods assign similar respondents to similar groups, the cluster structure is robust. If they disagree strongly, the patterns may be weak or algorithm-dependent.
+We adopt **FAMD + k-Means** as our primary clustering solution: it operates on FAMD-reduced continuous scores (avoiding the scale sensitivity of K-Prototypes on raw data), and unlike PAM it is not evaluated on the same metric it was optimized on. The other three methods serve as robustness checks. If they find similar groups, the cluster structure reflects real patterns in the data; if they diverge, it may be method-dependent.
 
-We use three complementary metrics. The **Adjusted Rand Index (ARI)** measures pairwise agreement between methods (1 = perfect agreement, 0 = random, negative = systematic disagreement). The **average silhouette width on Gower distance** evaluates each method's cluster quality on a common benchmark. Finally, **Jaccard bootstrap stability** assesses whether each cluster reappears when the data is resampled -- a direct test of robustness.
+We use three complementary metrics. The **Adjusted Rand Index (ARI)** measures pairwise agreement between methods (1 = perfect agreement, 0 = random, negative = systematic disagreement). The **average silhouette width on Gower distance** provides a common quality benchmark (with caveats). Finally, **Jaccard bootstrap stability** assesses whether each cluster reappears when the data is resampled -- a direct test of robustness.
 
 ## Agreement Between Methods (Adjusted Rand Index)
 
@@ -858,36 +873,26 @@ stability_df <- tibble(
 stability_df |>
   knitr::kable(digits = 3,
                caption = "Jaccard Bootstrap Stability (100 resamples). >0.75 = stable, <0.50 = artifact.")
+
+# Extract ARI and stability scalars for inline R in text below
+ari_famd_pam    <- round(ari_matrix["FAMD_KM", "PAM"], 3)
+ari_famd_mclust <- round(ari_matrix["FAMD_KM", "MClust"], 3)
+ari_famd_kproto <- round(ari_matrix["FAMD_KM", "KProto"], 3)
+famd_stability  <- round(mean(cb_famd$bootmean), 3)
 ```
 
 Note: K-Prototypes is excluded from bootstrap stability because `clusterboot` does not natively support the `kproto` algorithm.
 
-## Select Best Method
+**Takeaway**: The ARI between FAMD+k-Means and the three comparison methods ranges from `r min(ari_famd_pam, ari_famd_mclust, ari_famd_kproto)` to `r max(ari_famd_pam, ari_famd_mclust, ari_famd_kproto)`, indicating `r if (max(ari_famd_pam, ari_famd_mclust, ari_famd_kproto) > 0.65) "substantial" else if (max(ari_famd_pam, ari_famd_mclust, ari_famd_kproto) > 0.4) "moderate" else "weak"` cross-method agreement. FAMD+k-Means achieves a mean Jaccard bootstrap stability of `r famd_stability`, `r if (famd_stability >= 0.75) "above" else "below"` the conventional 0.75 threshold for stable clusters. Overall, the cluster structure is `r if (famd_stability >= 0.75 && min(ari_famd_pam, ari_famd_mclust, ari_famd_kproto) > 0.4) "robust across methods and resampling" else if (famd_stability >= 0.75) "stable under resampling, though methods differ on some boundary respondents" else "partially method-dependent, with some clusters less stable than others"`.
 
-We select the best method by balancing silhouette quality and bootstrap stability. PAM's silhouette advantage on Gower distance is expected (see caveat above), so we weight stability more heavily when the two metrics disagree.
+## Primary Method Assignment
+
+We use FAMD + k-Means as the primary clustering solution (see rationale above).
 
 ```{r}
 #| label: select-best
-# Combine silhouette and stability for the three bootstrapped methods
-selection_df <- sil_compare |>
-  filter(Method != "K-Prototypes") |>
-  left_join(stability_df |> select(Method, Mean_Jaccard), by = "Method") |>
-  mutate(combined = as.numeric(0.5 * scale(Avg_Silhouette) + 0.5 * scale(Mean_Jaccard)))
-
-best_method <- selection_df |> slice_max(combined, n = 1) |> pull(Method)
-cat("Best method (silhouette + stability):", best_method, "\n")
-
-selection_df |> knitr::kable(digits = 3, caption = "Method Selection: Combined Score")
-
 df_complete <- df_complete |>
-  mutate(
-    cluster_final = case_when(
-      best_method == "PAM"          ~ cluster_pam,
-      best_method == "FAMD+KMeans"  ~ cluster_famd,
-      best_method == "K-Prototypes" ~ cluster_kproto,
-      best_method == "Mclust"       ~ cluster_mclust
-    )
-  )
+  mutate(cluster_final = cluster_famd)
 
 # --- Data-driven cluster labeling (applied immediately for consistent names) ---
 # Uses salience score = value² / sample_mean for each (cluster, feature) pair.
@@ -1154,12 +1159,12 @@ invisible(NULL)
 
 ## Diverging Lollipop: Distinctive Traits per Cluster
 
-Each panel shows only the variables where the cluster deviates meaningfully from the sample average (|z| > 0.3 standard deviations). This highlights what makes each persona unique.
+Each variable row shows how all clusters deviate from the sample average (only deviations with |z| > 0.3 shown). Clusters are distinguished by color; upward triangles with solid stems mark above-average values, downward triangles with dashed stems mark below-average values.
 
 ```{r}
 #| label: lollipop-distinctive
-#| fig-height: 20
-#| fig-width: 12
+#| fig-height: 10
+#| fig-width: 8
 
 # Compute cluster means for all numeric variables
 numeric_vars_all <- c(
@@ -1248,33 +1253,60 @@ lollipop_df <- profile_data |>
   ) |>
   filter(abs(z_score) > 0.3) |>
   mutate(
-    direction = if_else(z_score > 0, "Above average", "Below average"),
-    variable = fct_reorder(variable, z_score)
+    direction = if_else(z_score > 0, "Above average", "Below average")
   )
 
-ggplot(lollipop_df, aes(x = z_score, y = variable, color = direction)) +
+# Reorder variables by max |z| within each group
+lollipop_df <- lollipop_df |>
+  group_by(variable) |>
+  mutate(max_abs_z = max(abs(z_score))) |>
+  ungroup() |>
+  mutate(variable = fct_reorder(variable, max_abs_z))
+
+# Clean label_lookup for legend (replace newlines with spaces)
+legend_labels <- setNames(gsub("\n", " ", label_lookup), names(label_lookup))
+
+ggplot(lollipop_df, aes(x = z_score, y = variable,
+                         color = cluster_final, fill = cluster_final,
+                         group = cluster_final)) +
   geom_vline(xintercept = 0, linewidth = 0.5, color = "grey50") +
-  geom_segment(aes(x = 0, xend = z_score, yend = variable), linewidth = 0.8) +
-  geom_point(size = 3) +
-  scale_color_manual(values = c("Above average" = "#B2182B", "Below average" = "#2166AC")) +
-  ggh4x::facet_grid2(var_group ~ cluster_final,
-                      scales = "free_y", space = "free_y",
-                      switch = "y",
-                      labeller = labeller(cluster_final = label_lookup)) +
+  geom_errorbarh(aes(xmin = 0, xmax = z_score, linetype = direction),
+                 height = 0, linewidth = 1,
+                 position = position_dodge(width = 0.7)) +
+  geom_point(aes(shape = direction), size = 3,
+             position = position_dodge(width = 0.7)) +
+  scale_color_clusters(name = "Cluster", labels = legend_labels) +
+  scale_fill_clusters(name = "Cluster", labels = legend_labels) +
+  scale_shape_manual(name = "Deviation",
+                     values = c("Above average" = 24, "Below average" = 25)) +
+  scale_linetype_manual(name = "Deviation",
+                        values = c("Above average" = "solid",
+                                   "Below average" = "dotted")) +
+  ggh4x::facet_grid2(var_group ~ ., scales = "free_y", space = "free_y",
+                      switch = "y") +
   labs(
     title = "Distinctive Traits per Cluster (deviation from sample average)",
     subtitle = "Only variables with |z| > 0.3 shown. Rows grouped by variable type.",
     x = "Standard deviations from sample mean",
-    y = NULL,
-    color = NULL
+    y = NULL
   ) +
   theme(
+    plot.title.position = "plot",
     legend.position = "top",
-    strip.text.x = element_text(size = 8, face = "bold"),
-    strip.text.y.left = element_text(size = 9, face = "bold", angle = 0),
+    legend.box = "horizontal",
+    strip.text.y.left = element_text(size = 11, face = "bold", angle = 0, color = "black"),
+    strip.background.y = element_rect(fill = "grey95", colour = "grey40"),
     strip.placement = "outside",
+    axis.text.y = element_text(size = 10, color = "black"),
+    axis.text.x = element_text(size = 10, color = "black"),
     panel.grid.major.y = element_blank(),
-    panel.spacing.y = unit(0.3, "lines")
+    panel.spacing.y = unit(0.5, "lines")
+  ) +
+  guides(
+    color = guide_legend(order = 1, ncol = 1),
+    fill = guide_legend(order = 1, ncol = 1),
+    shape = guide_legend(order = 2),
+    linetype = guide_legend(order = 2)
   )
 ```
 
@@ -1498,7 +1530,7 @@ tsne_df <- tibble(
 )
 
 ggplot(tsne_df, aes(tSNE1, tSNE2, color = Cluster, shape = Cluster)) +
-  geom_point(alpha = 0.55, size = 2) +
+  geom_point(alpha = 0.55, size = 2.5) +
   scale_color_clusters(name = "Cluster") +
   scale_shape_manual(name = "Cluster",
                      values = c(16, 17, 15, 18, 3, 4, 8, 1, 2)[seq_len(n_clusters)]) +
@@ -1522,7 +1554,7 @@ famd_df <- tibble(
 )
 
 ggplot(famd_df, aes(Dim1, Dim2, color = Cluster, shape = Cluster)) +
-  geom_point(alpha = 0.55, size = 2) +
+  geom_point(alpha = 0.55, size = 2.5) +
   scale_color_clusters(name = "Cluster") +
   scale_shape_manual(name = "Cluster",
                      values = c(16, 17, 15, 18, 3, 4, 8, 1, 2)[seq_len(n_clusters)]) +

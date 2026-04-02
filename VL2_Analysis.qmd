@@ -1649,3 +1649,348 @@ for (cl in levels(df_complete$cluster_final)) {
       p_limit_need, "% consider cars necessary.\n\n", sep = "")
 }
 ```
+
+# Geographic Analysis: CAP-Level Variation
+
+The cluster profiles above describe *who* the personas are, but not *where* they live. Distance from the Duomo is a useful proxy for urban-suburban gradients, yet it collapses Milan's rich spatial fabric into a single number. This section asks the complementary question: **do different neighborhoods (CAPs) host systematically different mixes of attitudes, behaviors, and priorities?**
+
+We restrict the analysis to Milan-proper CAPs (201xx) with at least 15 respondents, providing a reasonable minimum for stable summary statistics. Milan CAPs below this threshold are pooled into a single "Altro Milano" row for context. Non-Milan and malformed CAPs are excluded.
+
+```{r}
+#| label: cap-analysis-prep
+
+# --- Identify valid Milan CAPs with adequate sample size ---
+cap_counts <- df_complete |>
+  filter(grepl("^201", cap_clean)) |>
+  dplyr::count(cap_clean, name = "n_cap")
+
+valid_caps <- cap_counts |> filter(n_cap >= 15) |> pull(cap_clean)
+small_caps <- cap_counts |> filter(n_cap < 15)  |> pull(cap_clean)
+
+cat("Milan CAPs with n >= 15:", length(valid_caps), "\n")
+cat("Milan CAPs with n <  15:", length(small_caps),
+    "(total n =", sum(cap_counts$n_cap[cap_counts$cap_clean %in% small_caps]), ")\n")
+
+# --- Subset and tag rows ---
+df_cap <- df_complete |>
+  filter(cap_clean %in% c(valid_caps, small_caps)) |>
+  mutate(cap_group = if_else(cap_clean %in% valid_caps, cap_clean, "Altro Milano"))
+
+# --- Order CAPs by distance from Duomo (center → periphery) ---
+cap_order <- df_cap |>
+  filter(cap_group != "Altro Milano") |>
+  group_by(cap_group) |>
+  summarise(mean_dist = mean(dist_duomo_km, na.rm = TRUE), .groups = "drop") |>
+  arrange(mean_dist)
+
+# "Altro Milano" goes at the bottom; "Campione" (overall) at the very top
+cap_levels <- c("Campione", cap_order$cap_group, "Altro Milano")
+
+# --- Build labels with sample sizes ---
+cap_n <- df_cap |>
+  dplyr::count(cap_group, name = "n_cap")
+
+cap_label_lookup <- setNames(
+  paste0(cap_n$cap_group, "  (n=", cap_n$n_cap, ")"),
+  cap_n$cap_group
+)
+# Add the overall sample label
+n_total_cap <- nrow(df_cap)
+cap_label_lookup["Campione"] <- paste0("Campione  (n=", n_total_cap, ")")
+```
+
+## Cluster Composition by CAP
+
+The stacked bar chart below shows the share of each persona within every CAP. CAPs are ordered from city center (top) to periphery (bottom). A "Campione" reference row shows the overall sample composition. Marked differences in the color mix across rows indicate that persona prevalence varies geographically.
+
+```{r}
+#| label: cap-cluster-composition
+#| fig-height: 12
+#| fig-width: 9
+
+# Per-CAP cluster proportions
+cap_cluster <- df_cap |>
+  dplyr::count(cap_group, cluster_final) |>
+  group_by(cap_group) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup()
+
+# Add "Campione" row (overall sample proportions)
+sample_cluster <- df_cap |>
+  dplyr::count(cluster_final) |>
+  mutate(cap_group = "Campione", pct = n / sum(n))
+
+cap_cluster_all <- bind_rows(cap_cluster, sample_cluster) |>
+  mutate(
+    cap_group = factor(cap_group, levels = cap_levels),
+    cap_label = cap_label_lookup[as.character(cap_group)],
+    cap_label = factor(cap_label, levels = cap_label_lookup[cap_levels])
+  )
+
+ggplot(cap_cluster_all, aes(pct, cap_label, fill = cluster_final)) +
+  geom_col(position = "fill", width = 0.75) +
+  geom_hline(
+    yintercept = which(cap_levels == "Altro Milano") - 0.5,
+    linetype = "dotted", color = "grey40"
+  ) +
+  geom_hline(
+    yintercept = which(cap_levels == cap_order$cap_group[1]) - 0.5,
+    linetype = "dotted", color = "grey40"
+  ) +
+  scale_x_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_clusters(name = "Cluster") +
+  labs(
+    title = "Composizione dei Cluster per CAP",
+    subtitle = "CAP ordinati dal centro (alto) alla periferia (basso)",
+    x = NULL, y = NULL
+  ) +
+  theme(
+    axis.text.y = element_text(size = 8, family = "mono"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 7),
+    panel.grid.major.y = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+## Heatmap: Attitude and Behavior Profiles by CAP
+
+The heatmap shows 12 selected dimensions (spanning attitudes, transport, priorities, policy, and demographics) across CAPs. Cell color encodes the z-score -- how many sample standard deviations the CAP mean deviates from the overall mean (red = above, blue = below). Raw mean values are printed inside each cell.
+
+```{r}
+#| label: cap-heatmap
+#| fig-height: 14
+#| fig-width: 12
+
+# --- Compute per-CAP means for selected variables ---
+cap_profiles <- df_cap |>
+  group_by(cap_group) |>
+  summarise(
+    spazio_auto     = mean(spazio_auto),
+    meno_auto_clima = mean(meno_auto_clima),
+    normale_auto    = mean(normale_auto),
+    trasp_pub_ineff = mean(trasp_pub_ineff),
+    piu_verde       = mean(piu_verde),
+    prio_mobilita_sost = mean(prio_mobilita_sost),
+    prio_parcheggi  = mean(prio_parcheggi),
+    `auto (%)`      = mean(auto == "Yes") * 100,
+    `bici (%)`      = mean(bici == "Yes") * 100,
+    `mezzi pub. (%)` = mean(mezzi_pub == "Yes") * 100,
+    `pro limite auto (%)` = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città") * 100,
+    eta             = mean(eta),
+    .groups = "drop"
+  )
+
+# Add "Campione" row
+sample_row <- df_cap |>
+  summarise(
+    cap_group       = "Campione",
+    spazio_auto     = mean(spazio_auto),
+    meno_auto_clima = mean(meno_auto_clima),
+    normale_auto    = mean(normale_auto),
+    trasp_pub_ineff = mean(trasp_pub_ineff),
+    piu_verde       = mean(piu_verde),
+    prio_mobilita_sost = mean(prio_mobilita_sost),
+    prio_parcheggi  = mean(prio_parcheggi),
+    `auto (%)`      = mean(auto == "Yes") * 100,
+    `bici (%)`      = mean(bici == "Yes") * 100,
+    `mezzi pub. (%)` = mean(mezzi_pub == "Yes") * 100,
+    `pro limite auto (%)` = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città") * 100,
+    eta             = mean(eta)
+  )
+
+cap_profiles_all <- bind_rows(cap_profiles, sample_row)
+
+# --- Sample-level means and SDs for z-score computation ---
+hm_vars <- setdiff(names(cap_profiles_all), "cap_group")
+
+sample_means_cap <- df_cap |>
+  summarise(
+    spazio_auto     = mean(spazio_auto),
+    meno_auto_clima = mean(meno_auto_clima),
+    normale_auto    = mean(normale_auto),
+    trasp_pub_ineff = mean(trasp_pub_ineff),
+    piu_verde       = mean(piu_verde),
+    prio_mobilita_sost = mean(prio_mobilita_sost),
+    prio_parcheggi  = mean(prio_parcheggi),
+    `auto (%)`      = mean(auto == "Yes") * 100,
+    `bici (%)`      = mean(bici == "Yes") * 100,
+    `mezzi pub. (%)` = mean(mezzi_pub == "Yes") * 100,
+    `pro limite auto (%)` = mean(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città") * 100,
+    eta             = mean(eta)
+  ) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "sample_mean")
+
+sample_sds_cap <- df_cap |>
+  summarise(
+    spazio_auto     = sd(spazio_auto),
+    meno_auto_clima = sd(meno_auto_clima),
+    normale_auto    = sd(normale_auto),
+    trasp_pub_ineff = sd(trasp_pub_ineff),
+    piu_verde       = sd(piu_verde),
+    prio_mobilita_sost = sd(prio_mobilita_sost),
+    prio_parcheggi  = sd(prio_parcheggi),
+    `auto (%)`      = sd(as.numeric(auto == "Yes")) * 100,
+    `bici (%)`      = sd(as.numeric(bici == "Yes")) * 100,
+    `mezzi pub. (%)` = sd(as.numeric(mezzi_pub == "Yes")) * 100,
+    `pro limite auto (%)` = sd(as.numeric(limitare_auto == "Limiterei le auto per migliorare la qualità della vita in città")) * 100,
+    eta             = sd(eta)
+  ) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "sample_sd")
+
+# --- Variable grouping for x-axis facets ---
+var_group_cap <- c(
+  "spazio_auto" = "Atteggiamenti", "meno_auto_clima" = "Atteggiamenti",
+  "normale_auto" = "Atteggiamenti", "trasp_pub_ineff" = "Atteggiamenti",
+  "piu_verde" = "Atteggiamenti",
+  "prio_mobilita_sost" = "Priorità", "prio_parcheggi" = "Priorità",
+  "auto (%)" = "Trasporto", "bici (%)" = "Trasporto",
+  "mezzi pub. (%)" = "Trasporto",
+  "pro limite auto (%)" = "Politica",
+  "eta" = "Demografia"
+)
+
+# --- Long format with z-scores ---
+hm_long <- cap_profiles_all |>
+  pivot_longer(-cap_group, names_to = "variable", values_to = "mean_val") |>
+  left_join(sample_means_cap, by = "variable") |>
+  left_join(sample_sds_cap, by = "variable") |>
+  mutate(
+    z_score = (mean_val - sample_mean) / sample_sd,
+    cap_label = cap_label_lookup[cap_group],
+    cap_label = factor(cap_label, levels = rev(cap_label_lookup[cap_levels])),
+    var_group = factor(var_group_cap[variable],
+                       levels = c("Atteggiamenti", "Priorità", "Trasporto",
+                                  "Politica", "Demografia"))
+  )
+
+# --- Format display values ---
+hm_long <- hm_long |>
+  mutate(display_val = case_when(
+    grepl("%", variable) ~ paste0(round(mean_val), "%"),
+    variable == "eta"    ~ as.character(round(mean_val, 1)),
+    TRUE                 ~ as.character(round(mean_val, 1))
+  ))
+
+ggplot(hm_long, aes(variable, cap_label, fill = z_score)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = display_val), size = 2.4) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B",
+    midpoint = 0, name = "Z-score",
+    limits = c(-2, 2), oob = scales::squish
+  ) +
+  facet_grid(. ~ var_group, scales = "free_x", space = "free_x") +
+  labs(
+    title = "Profilo per CAP -- Heatmap delle Deviazioni dalla Media Campionaria",
+    subtitle = "Rosso = sopra la media, Blu = sotto la media. Valori grezzi nelle celle.",
+    x = NULL, y = NULL
+  ) +
+  theme(
+    axis.text.x.top = element_text(size = 7.5, angle = 40, hjust = 0, margin = margin(b = 5)),
+    axis.text.y = element_text(size = 7, family = "mono"),
+    strip.text  = element_text(size = 9, face = "bold", margin = margin(b = 8)),
+    strip.placement = "outside",
+    panel.grid  = element_blank(),
+    legend.position = "right"
+  ) +
+  scale_x_discrete(position = "top")
+```
+
+## Spatial Map: Cluster Composition by CAP
+
+Each pie chart represents a CAP centroid at its geocoded location, showing the full cluster composition (not just the dominant one). Pie size is proportional to sample size. Dashed circles mark Milan's cerchie (ring roads) for geographic reference.
+
+```{r}
+#| label: cap-spatial-map
+#| fig-height: 10
+#| fig-width: 10
+
+library(scatterpie)
+
+# --- Cluster proportions and coordinates per CAP ---
+cap_geo <- df_cap |>
+  filter(cap_group != "Altro Milano") |>
+  group_by(cap_group) |>
+  summarise(
+    lon = mean(cap_lon, na.rm = TRUE),
+    lat = mean(cap_lat, na.rm = TRUE),
+    n_cap = n(),
+    .groups = "drop"
+  )
+
+# Wide-format cluster proportions for scatterpie
+cluster_lvls <- levels(df_complete$cluster_final)
+
+cap_wide <- df_cap |>
+  filter(cap_group != "Altro Milano") |>
+  dplyr::count(cap_group, cluster_final) |>
+  group_by(cap_group) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  select(-n) |>
+  pivot_wider(names_from = cluster_final, values_from = pct, values_fill = 0) |>
+  left_join(cap_geo, by = "cap_group")
+
+# Pie radius proportional to sqrt(n) for area-proportional scaling
+cap_wide <- cap_wide |>
+  mutate(radius = 0.002 + 0.003 * sqrt(n_cap) / max(sqrt(n_cap)))
+
+# --- Cerchie as circles around Duomo ---
+duomo_lon <- 9.1900
+duomo_lat <- 45.4642
+
+km_to_lat <- 1 / 111
+km_to_lon <- 1 / (111 * cos(duomo_lat * pi / 180))
+
+cerchie_circles <- cerchie |>
+  crossing(theta = seq(0, 2 * pi, length.out = 100)) |>
+  mutate(
+    lon = duomo_lon + dist * km_to_lon * cos(theta),
+    lat = duomo_lat + dist * km_to_lat * sin(theta)
+  )
+
+ggplot() +
+  # Cerchie reference circles
+  geom_path(
+    data = cerchie_circles,
+    aes(lon, lat, group = label),
+    linetype = "dashed", color = "grey60", linewidth = 0.3
+  ) +
+  geom_text(
+    data = cerchie |> mutate(
+      lon = duomo_lon + dist * km_to_lon,
+      lat = duomo_lat + 0.002
+    ),
+    aes(lon, lat, label = label),
+    size = 2.5, color = "grey40", hjust = 0, nudge_x = 0.002
+  ) +
+  # Duomo center marker
+  annotate("point", x = duomo_lon, y = duomo_lat,
+           shape = 4, size = 3, stroke = 1, color = "black") +
+  # Pie charts at each CAP centroid
+  geom_scatterpie(
+    data = cap_wide,
+    aes(x = lon, y = lat, r = radius),
+    cols = cluster_lvls,
+    color = "grey30", linewidth = 0.2
+  ) +
+  # CAP labels
+  geom_text(
+    data = cap_wide,
+    aes(lon, lat, label = cap_group),
+    size = 1.8, nudge_y = 0.008, color = "grey20"
+  ) +
+  scale_fill_clusters(name = "Cluster") +
+  coord_fixed(ratio = 1 / cos(duomo_lat * pi / 180)) +
+  labs(
+    title = "Mappa dei CAP -- Composizione dei Cluster per Zona",
+    subtitle = "Dimensione torta = n rispondenti; cerchi tratteggiati = cerchie di Milano; X = Piazza del Duomo"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 9, color = "grey40")
+  )
+```

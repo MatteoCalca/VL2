@@ -38,7 +38,9 @@
       "Bash(ls /mnt/c/Users/calcm/Documents/GitHub/VL2/renv*)",
       "WebSearch",
       "WebFetch(domain:jtr13.github.io)",
-      "WebFetch(domain:www.yihanwu.ca)"
+      "WebFetch(domain:www.yihanwu.ca)",
+      "Bash(grep -v '^$')",
+      "Bash(python3)"
     ]
   }
 }

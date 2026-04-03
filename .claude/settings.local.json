@@ -40,7 +40,10 @@
       "WebFetch(domain:jtr13.github.io)",
       "WebFetch(domain:www.yihanwu.ca)",
       "Bash(grep -v '^$')",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Bash(grep -E \"\\\\.\\(csv|rds|RData|R\\)$\")",
+      "Bash(grep -E \"^#{1,3} [A-Z]\" \"c:\\\\Users\\\\calcm\\\\Documents\\\\GitHub\\\\VL2\\\\VL2_Analysis.qmd\")",
+      "Bash(find /mnt/c/Users/calcm/Documents/GitHub/VL2 -type f \\\\\\(-name *.R -o -name *.r \\\\\\))"
     ]
   }
 }

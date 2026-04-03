@@ -989,6 +989,31 @@ label_profiles |>
                caption = "Cluster label assignment (salience = value\u00b2 / sample mean)")
 ```
 
+## Export Clustered Data
+
+```{r}
+#| label: export-clustered-csv
+
+# Identify which rows of df (= same order as raw) survived listwise deletion
+complete_rows <- which(complete.cases(df[, clustering_vars]))
+
+cluster_lookup <- tibble(
+  raw_row      = complete_rows,
+  cluster_id   = df_complete$cluster_famd,
+  cluster_name = df_complete$cluster_final
+)
+
+raw_with_clusters <- raw |>
+  mutate(raw_row = row_number()) |>
+  left_join(cluster_lookup, by = "raw_row") |>
+  select(-raw_row)
+
+write_csv(raw_with_clusters, "VL2_clustered.csv")
+cat("Exported", nrow(raw_with_clusters), "rows to VL2_clustered.csv\n")
+cat("  With cluster:", sum(!is.na(raw_with_clusters$cluster_id)), "\n")
+cat("  Without (dropped):", sum(is.na(raw_with_clusters$cluster_id)), "\n")
+```
+
 # Cluster Profiling
 
 Clustering tells us *who goes with whom*, but not *why*. This section characterizes each cluster by examining how its members differ from the overall sample on every variable. We look at numeric means, categorical proportions, and demographic distributions to build a complete portrait of each persona.
@@ -1647,6 +1672,448 @@ for (cl in levels(df_complete$cluster_final)) {
       p_limit_yes, "% would limit unconditionally, ",
       p_limit_solo, "% only with alternatives, ",
       p_limit_need, "% consider cars necessary.\n\n", sep = "")
+}
+```
+
+# Personas: Individui Rappresentativi
+
+I profili seguenti descrivono, per ciascun cluster, l'**individuo rappresentativo**: il rispondente reale che meglio incarna il proprio gruppo. La selezione avviene in due fasi: (1) si identificano i membri più centrali del cluster (top 10% per distanza di Gower complessiva più bassa), garantendo che il candidato sia geometricamente vicino a tutti gli altri; (2) tra questi, si sceglie quello che minimizza la discrepanza con il profilo aggregato del cluster (somma degli z-score in valore assoluto per le variabili numeriche + numero di scostamenti dalla moda per le variabili categoriali). Questo approccio produce un individuo che è sia centrale nel cluster sia fedele alle sue tendenze aggregate. Per ogni persona, si verifica la coerenza con le medie del cluster: eventuali scostamenti superiori a 1 deviazione standard (per le variabili numeriche) o rispetto alla moda (per le variabili categoriali) vengono segnalati.
+
+## Calcolo dei medoidi e verifica di rappresentatività
+
+```{r}
+#| label: persona-medoids
+
+# Convert Gower dissimilarity to full matrix (once)
+gower_mat <- as.matrix(gower_dist)
+
+# Variables used for the discrepancy score
+numeric_vars_disc <- c(
+  "spazio_auto", "trasp_pub_ineff", "meno_auto_clima", "normale_auto",
+  "piu_verde", "aggreg_disturbo", "parcheggi_aggreg",
+  "eta", "dist_duomo_km",
+  priority_short
+)
+cat_vars_disc <- c("auto", "bici", "mezzi_pub", "piedi", "moto_scooter",
+                    "taxi", "monopattino", "limitare_auto", "lavoro", "genere")
+
+# Find representative individual for each FAMD+k-Means cluster:
+#   1. Select the top 10% most central members (lowest total Gower distance)
+#   2. Among those, pick the one minimizing discrepancy with cluster aggregates
+#      (sum of |z-scores| for numeric vars + count of mode mismatches for categorical)
+medoid_indices <- sapply(levels(df_complete$cluster_final), function(cl) {
+  idx <- which(df_complete$cluster_final == cl)
+  sub_mat <- gower_mat[idx, idx, drop = FALSE]
+  total_dist <- rowSums(sub_mat)
+
+  # Step 1: top 10% most central (at least 1 candidate)
+  n_top <- max(1, ceiling(length(idx) * 0.10))
+  top_local <- order(total_dist)[1:n_top]
+  candidates <- idx[top_local]
+
+  # Step 2: discrepancy score against cluster aggregates
+  d <- df_complete[idx, ]
+
+  # Pre-compute cluster means/SDs and modes
+  cl_means <- sapply(numeric_vars_disc, function(v) mean(d[[v]], na.rm = TRUE))
+  cl_sds   <- sapply(numeric_vars_disc, function(v) sd(d[[v]], na.rm = TRUE))
+  cl_sds[is.na(cl_sds) | cl_sds == 0] <- Inf  # avoid division by zero; z = 0
+  cl_modes <- sapply(cat_vars_disc, function(v) names(sort(table(d[[v]]), decreasing = TRUE))[1])
+
+  discrepancy <- sapply(candidates, function(row_idx) {
+    r <- df_complete[row_idx, ]
+    # Numeric: sum of |z-scores|
+    z_sum <- sum(abs((sapply(numeric_vars_disc, function(v) r[[v]]) - cl_means) / cl_sds))
+    # Categorical: count of mode mismatches
+    cat_miss <- sum(sapply(cat_vars_disc, function(v) as.character(r[[v]]) != cl_modes[v]))
+    z_sum + cat_miss
+  })
+
+  candidates[which.min(discrepancy)]
+})
+
+# Extract representative rows
+medoid_df <- df_complete |> slice(medoid_indices)
+
+# --- Representativeness check ---
+numeric_vars_check <- c(
+  "spazio_auto", "trasp_pub_ineff", "meno_auto_clima", "normale_auto",
+  "piu_verde", "aggreg_disturbo", "parcheggi_aggreg",
+  "eta", "dist_duomo_km",
+  priority_short
+)
+
+cat_vars_check <- c("auto", "bici", "mezzi_pub", "piedi", "moto_scooter",
+                     "taxi", "monopattino", "limitare_auto", "lavoro", "genere")
+
+repr_check <- map_dfr(levels(df_complete$cluster_final), function(cl) {
+  d <- df_complete |> filter(cluster_final == cl)
+  med_row <- medoid_df |> filter(cluster_final == cl)
+
+  # Numeric variables
+  num_rows <- map_dfr(numeric_vars_check, function(v) {
+    cl_mean <- mean(d[[v]], na.rm = TRUE)
+    cl_sd   <- sd(d[[v]], na.rm = TRUE)
+    med_val <- med_row[[v]]
+    z <- if (!is.na(cl_sd) && cl_sd > 0) (med_val - cl_mean) / cl_sd else 0
+    tibble(
+      cluster = cl, variable = v, type = "numeric",
+      medoid_value = as.character(round(med_val, 1)),
+      cluster_summary = paste0(round(cl_mean, 1), " (sd ", round(cl_sd, 1), ")"),
+      z_score = round(z, 2),
+      flag = if_else(abs(z) > 1, "deviazione", "OK")
+    )
+  })
+
+  # Categorical variables
+  cat_rows <- map_dfr(cat_vars_check, function(v) {
+    mode_val <- names(sort(table(d[[v]]), decreasing = TRUE))[1]
+    med_val  <- as.character(med_row[[v]])
+    tibble(
+      cluster = cl, variable = v, type = "categorical",
+      medoid_value = med_val,
+      cluster_summary = paste0("moda: ", mode_val),
+      z_score = NA_real_,
+      flag = if_else(med_val == mode_val, "OK", "deviazione")
+    )
+  })
+
+  bind_rows(num_rows, cat_rows)
+})
+```
+
+## Tabella di confronto: medoide vs. media del cluster
+
+```{r}
+#| label: persona-table
+
+# Italian variable labels for display
+var_labels_it <- c(
+  eta = "Età", dist_duomo_km = "Distanza Duomo (km)",
+  spazio_auto = "Troppo spazio auto", trasp_pub_ineff = "Trasp. pub. inefficiente",
+  meno_auto_clima = "Meno auto per il clima", normale_auto = "Normale avere auto",
+  piu_verde = "Più verde", aggreg_disturbo = "Aggregazione = disturbo",
+  parcheggi_aggreg = "Parcheggi → socialità",
+  prio_circolazione = "Prio: circolazione", prio_mobilita_sost = "Prio: mobilità sost.",
+  prio_parcheggi = "Prio: parcheggi", prio_verde_urbano = "Prio: verde urbano",
+  prio_cultura_sport = "Prio: cultura/sport", prio_socialita = "Prio: socialità",
+  auto = "Usa auto", bici = "Usa bici", mezzi_pub = "Usa mezzi pub.",
+  piedi = "A piedi", moto_scooter = "Moto/scooter",
+  limitare_auto = "Limitare auto", lavoro = "Lavoro", genere = "Genere"
+)
+
+# Build comparison table
+comparison_rows <- repr_check |>
+  mutate(
+    variable_it = if_else(variable %in% names(var_labels_it),
+                          var_labels_it[variable], variable),
+    confronto = case_when(
+      flag == "deviazione" & type == "numeric" ~
+        paste0("\u26a0 z = ", z_score),
+      flag == "deviazione" & type == "categorical" ~
+        "\u26a0 diverso dalla moda",
+      TRUE ~ "\u2713"
+    )
+  ) |>
+  select(Cluster = cluster, Variabile = variable_it,
+         Medoide = medoid_value, `Media/Moda cluster` = cluster_summary,
+         Verifica = confronto)
+
+# Summary: deviations per cluster
+dev_summary <- repr_check |>
+  filter(flag == "deviazione") |>
+  dplyr::count(cluster, name = "n_deviazioni")
+
+dev_summary |>
+  left_join(
+    tibble(cluster = levels(df_complete$cluster_final),
+           n_membri = as.integer(table(df_complete$cluster_final))),
+    by = "cluster"
+  ) |>
+  knitr::kable(caption = "Numero di deviazioni per cluster",
+               col.names = c("Cluster", "Deviazioni (su 25 variabili)", "Membri"))
+```
+
+::: {.callout-note collapse="true"}
+## Dettaglio completo del confronto medoide vs. cluster
+
+```{r}
+#| label: persona-table-detail
+
+comparison_rows |>
+  knitr::kable(caption = "Confronto completo: individuo rappresentativo vs. tendenza centrale del cluster")
+```
+:::
+
+## Profili narrativi per la comunicazione
+
+I profili seguenti sono pensati come strumenti operativi per il team di comunicazione. Ogni persona sintetizza il proprio cluster in un ritratto narrativo che combina due livelli di informazione:
+
+- **Dati individuali (medoide).** Il paragrafo di apertura — nome, età, professione, distanza dal Duomo, mezzi di trasporto utilizzati, posizione sulla limitazione delle auto — e le priorità per Milano descrivono l'**individuo rappresentativo** del cluster, selezionato con il metodo descritto sopra. Questo dà concretezza al profilo e lo rende più facilmente comunicabile.
+- **Tratti distintivi del gruppo (medie del cluster).** La sezione «Cosa caratterizza questo gruppo» riporta solo le variabili per cui la media del cluster si discosta in modo rilevante dalla media campionaria (|z| > 0,3), le stesse evidenziate nel lollipop chart precedente. Questo garantisce che la caratterizzazione rifletta il comportamento collettivo del segmento, non le idiosincrasie di un singolo rispondente.
+
+Per il dettaglio analitico completo (tutti i punteggi, scostamenti e z-score), si rimanda alla tabella di confronto nella sezione precedente.
+
+```{r}
+#| label: persona-narratives
+#| results: asis
+#| echo: false
+
+# --- Name pools by gender ---
+nomi_donna <- c("Giulia", "Francesca", "Chiara", "Alessandra", "Valentina", "Martina")
+nomi_uomo  <- c("Marco", "Luca", "Alessandro", "Matteo", "Giovanni", "Andrea")
+nomi_altro <- c("Alex", "Noa", "Sam", "Elia", "Gaia", "Mika")
+
+set.seed(42)
+
+# --- Italian transport mode labels ---
+transport_it <- c(
+  auto = "l'auto", bici = "la bicicletta", mezzi_pub = "i mezzi pubblici",
+  piedi = "gli spostamenti a piedi", moto_scooter = "la moto/scooter",
+  taxi = "il taxi", monopattino = "il monopattino elettrico"
+)
+
+# --- Likert variable descriptions (Italian, third person, no numeric scores) ---
+likert_desc <- list(
+  spazio_auto = list(
+    low = "non ritiene che ci sia troppo spazio dedicato alle auto",
+    mid = "è moderatamente critico/a verso lo spazio dedicato alle auto",
+    high = "ritiene fortemente che ci sia troppo spazio per le auto in città"
+  ),
+  trasp_pub_ineff = list(
+    low = "considera il trasporto pubblico sostanzialmente efficiente",
+    mid = "ha un giudizio ambivalente sull'efficienza del trasporto pubblico",
+    high = "considera il trasporto pubblico decisamente inefficiente"
+  ),
+  meno_auto_clima = list(
+    low = "non è convinto/a che ridurre le auto aiuterebbe il clima",
+    mid = "crede moderatamente che meno auto farebbero bene al clima",
+    high = "crede fortemente che ridurre le auto sia importante per il clima"
+  ),
+  normale_auto = list(
+    low = "non considera affatto normale avere auto per strada",
+    mid = "ha un atteggiamento neutro verso la normalità delle auto in strada",
+    high = "considera del tutto normale che ci siano auto in città"
+  ),
+  piu_verde = list(
+    low = "non avverte una forte necessità di più verde urbano",
+    mid = "desidera moderatamente più verde in città",
+    high = "desidera fortemente più spazi verdi in città"
+  ),
+  aggreg_disturbo = list(
+    low = "non associa i luoghi di aggregazione al disturbo",
+    mid = "ha un atteggiamento ambivalente su aggregazione e disturbo",
+    high = "associa fortemente i luoghi di aggregazione al disturbo"
+  ),
+  parcheggi_aggreg = list(
+    low = "non è favorevole a convertire i parcheggi in spazi sociali",
+    mid = "è moderatamente favorevole alla conversione dei parcheggi in spazi di socialità",
+    high = "è molto favorevole a trasformare i parcheggi in spazi di aggregazione"
+  )
+)
+
+likert_tier <- function(val) {
+  if (val <= 3) "low" else if (val <= 6) "mid" else "high"
+}
+
+# --- Priority full names ---
+prio_names_it <- setNames(priority_categories, priority_short)
+
+# --- limitare_auto → natural language (third person) ---
+limitare_frasi <- c(
+  "Limiterei le auto per migliorare la qualità della vita in città" =
+    "limiterebbe le auto senza condizioni per migliorare la qualità della vita in città",
+  "Limiterei le auto SOLO se ci fossero buone alternative per muoversi" =
+    "limiterebbe le auto solo a condizione che esistano buone alternative di trasporto",
+  "Trovo che le auto siano necessarie per la vita quotidiana" =
+    "ritiene che le auto siano necessarie per la vita quotidiana",
+  "Non sento il bisogno di cambiare la situazione attuale" =
+    "non sente il bisogno di cambiare la situazione attuale",
+  "Non ho un'opinione precisa a riguardo" =
+    "non ha un'opinione precisa a riguardo"
+)
+
+# --- Reuse lollipop_df for distinctive traits (all variable groups, |z|>0.3) ---
+# lollipop_df was computed in the lollipop-distinctive chunk and contains z-scores
+# for attitudes, transport %, priorities, policy, and demographics.
+
+# --- Italian natural-language descriptions for ALL lollipop variables ---
+# Maps each (variable, direction) pair to a third-person Italian phrase.
+trait_desc_it <- list(
+  # Attitudes (Likert)
+  spazio_auto = list(
+    above = "ritiene fortemente che ci sia troppo spazio per le auto in città",
+    below = "non ritiene che ci sia troppo spazio dedicato alle auto"
+  ),
+  trasp_pub_ineff = list(
+    above = "considera il trasporto pubblico decisamente inefficiente",
+    below = "considera il trasporto pubblico sostanzialmente efficiente"
+  ),
+  meno_auto_clima = list(
+    above = "crede fortemente che ridurre le auto sia importante per il clima",
+    below = "non è convinto/a che ridurre le auto aiuterebbe il clima"
+  ),
+  normale_auto = list(
+    above = "considera del tutto normale che ci siano auto in città",
+    below = "non considera affatto normale avere auto per strada"
+  ),
+  piu_verde = list(
+    above = "desidera fortemente più spazi verdi in città",
+    below = "non avverte una forte necessità di più verde urbano"
+  ),
+  aggreg_disturbo = list(
+    above = "associa fortemente i luoghi di aggregazione al disturbo",
+    below = "non associa i luoghi di aggregazione al disturbo"
+  ),
+  parcheggi_aggreg = list(
+    above = "è molto favorevole a trasformare i parcheggi in spazi di aggregazione",
+    below = "non è favorevole a convertire i parcheggi in spazi sociali"
+  ),
+  # Transport modes
+  `auto (% uso)` = list(
+    above = "usa l'auto molto più della media",
+    below = "usa l'auto molto meno della media"
+  ),
+  `bici (% uso)` = list(
+    above = "usa la bicicletta molto più della media",
+    below = "usa la bicicletta molto meno della media"
+  ),
+  `mezzi pubblici (% uso)` = list(
+    above = "usa i mezzi pubblici molto più della media",
+    below = "usa i mezzi pubblici molto meno della media"
+  ),
+  `piedi (% uso)` = list(
+    above = "si sposta a piedi molto più della media",
+    below = "si sposta a piedi molto meno della media"
+  ),
+  `moto/scooter (% uso)` = list(
+    above = "usa la moto o lo scooter molto più della media",
+    below = "usa la moto o lo scooter molto meno della media"
+  ),
+  # Priorities (Borda scores)
+  prio_circolazione = list(
+    above = "dà molta priorità al miglioramento della circolazione auto",
+    below = "dà poca priorità al miglioramento della circolazione auto"
+  ),
+  prio_mobilita_sost = list(
+    above = "dà molta priorità alla mobilità sostenibile",
+    below = "dà poca priorità alla mobilità sostenibile"
+  ),
+  prio_parcheggi = list(
+    above = "dà molta priorità a più parcheggi",
+    below = "dà poca priorità a più parcheggi"
+  ),
+  prio_verde_urbano = list(
+    above = "dà molta priorità al verde urbano",
+    below = "dà poca priorità al verde urbano"
+  ),
+  prio_cultura_sport = list(
+    above = "dà molta priorità a spazi culturali e sportivi",
+    below = "dà poca priorità a spazi culturali e sportivi"
+  ),
+  prio_socialita = list(
+    above = "dà molta priorità a spazi di socialità e famiglie",
+    below = "dà poca priorità a spazi di socialità e famiglie"
+  ),
+  # Policy
+  `limiterebbe senza condizioni (%)` = list(
+    above = "è molto più propenso/a della media a limitare le auto senza condizioni",
+    below = "è molto meno propenso/a della media a limitare le auto senza condizioni"
+  ),
+  `auto necessarie (%)` = list(
+    above = "ritiene le auto necessarie per la vita quotidiana molto più della media",
+    below = "ritiene le auto necessarie molto meno della media"
+  ),
+  # Demographics
+  eta = list(
+    above = "è mediamente più anziano/a della media del campione",
+    below = "è mediamente più giovane della media del campione"
+  ),
+  dist_duomo_km = list(
+    above = "vive mediamente più lontano dal centro rispetto al campione",
+    below = "vive mediamente più vicino al centro rispetto al campione"
+  )
+)
+
+# --- Generate one persona per cluster ---
+for (i in seq_along(levels(df_complete$cluster_final))) {
+  cl <- levels(df_complete$cluster_final)[i]
+  med <- medoid_df |> filter(cluster_final == cl)
+  n_cl <- sum(df_complete$cluster_final == cl)
+  pct_cl <- round(n_cl / nrow(df_complete) * 100, 1)
+  fraction_denom <- round(nrow(df_complete) / n_cl)
+
+  # Assign name by gender
+  gen <- as.character(med$genere)
+  idx_name <- ((i - 1) %% 6) + 1
+  nome <- if (gen == "Donna") nomi_donna[idx_name]
+          else if (gen == "Uomo") nomi_uomo[idx_name]
+          else nomi_altro[idx_name]
+  suf <- if (gen == "Donna") "a" else if (gen == "Uomo") "o" else "\u0259"
+
+  # --- Distinctive traits from lollipop_df (already filtered at |z|>0.3) ---
+  cl_traits <- lollipop_df |>
+    filter(cluster_final == cl) |>
+    arrange(desc(abs(z_score)))
+
+  # --- Transport modes ---
+  modes_used <- names(transport_it)[sapply(names(transport_it), function(m) med[[m]] == "Yes")]
+  modes_str <- if (length(modes_used) > 0) {
+    paste(transport_it[modes_used], collapse = ", ")
+  } else {
+    "nessun mezzo abituale dichiarato"
+  }
+
+  # --- Car policy stance ---
+  lim_val <- as.character(med$limitare_auto)
+  lim_frase <- limitare_frasi[lim_val]
+  if (is.na(lim_frase)) lim_frase <- paste0("ha risposto: \u00ab", lim_val, "\u00bb")
+
+  # ===================== OUTPUT =====================
+
+  # --- Header ---
+  cat("\n### ", cl, "\n\n", sep = "")
+  cat("*Circa 1 milanese su ", fraction_denom, " nel campione (n\u00a0=\u00a0",
+      n_cl, ", ", pct_cl, "%)*\n\n", sep = "")
+
+  # --- Flowing opening paragraph ---
+  cat("**", nome, "** ha ", round(med$eta), " anni, è ",
+      tolower(as.character(med$lavoro)),
+      " e vive a circa ", round(med$dist_duomo_km, 1),
+      " km dal Duomo. ", sep = "")
+  cat("Per spostarsi in città utilizza ", modes_str, ". ", sep = "")
+  cat("Riguardo alla politica sulle auto, ", nome, " ", lim_frase, ".\n\n", sep = "")
+
+  # --- Distinctive traits (from lollipop, natural language) ---
+  cat("**Cosa caratterizza questo gruppo.** Rispetto al campione complessivo, questo profilo si distingue perché ", sep = "")
+  att_phrases <- character(0)
+  for (j in seq_len(nrow(cl_traits))) {
+    var <- as.character(cl_traits$variable[j])
+    dir <- cl_traits$direction[j]
+    dir_key <- if (dir == "Above average") "above" else "below"
+    if (var %in% names(trait_desc_it) && dir_key %in% names(trait_desc_it[[var]])) {
+      att_phrases <- c(att_phrases, trait_desc_it[[var]][[dir_key]])
+    }
+  }
+  if (length(att_phrases) > 0) {
+    cat(paste(att_phrases, collapse = "; "), ".\n\n", sep = "")
+  } else {
+    cat("non presenta tratti marcatamente diversi dalla media.\n\n")
+  }
+
+  # --- Priorities (from medoid) ---
+  prio_vals <- sapply(priority_short, function(p) med[[p]])
+  prio_order <- names(sort(prio_vals, decreasing = TRUE))
+  top2 <- prio_order[1:min(2, length(prio_order))]
+  if (prio_vals[top2[1]] == 0) {
+    cat("**Le sue priorità per Milano.** Non ha indicato priorità particolari.\n\n")
+  } else if (length(top2) == 2 && prio_vals[top2[2]] > 0) {
+    cat("**Le sue priorità per Milano.** \u00ab", prio_names_it[top2[1]],
+        "\u00bb e \u00ab", prio_names_it[top2[2]], "\u00bb.\n\n", sep = "")
+  } else {
+    cat("**Le sue priorità per Milano.** \u00ab", prio_names_it[top2[1]], "\u00bb.\n\n", sep = "")
+  }
+
 }
 ```
 

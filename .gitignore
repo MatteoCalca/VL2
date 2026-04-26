@@ -2,3 +2,13 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Quarto / knitr render artifacts
+VL2_Analysis_files/
+VL2_Analysis_cache/
+VL2_Analysis.html
+.quarto/
+
+# UDPipe model + cached annotations (regenerated on first render)
+udpipe_models/
+udpipe_annotations.rds

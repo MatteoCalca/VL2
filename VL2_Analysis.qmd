@@ -29,7 +29,8 @@ required_pkgs <- c(
   "cluster", "FactoMineR", "factoextra", "clustMixType", "mclust",
   "corrplot", "patchwork", "ggrepel", "ggforce", "knitr",
   "tidygeocoder", "geosphere", "Rtsne", "fpc",
-  "ggh4x", "ggtext"
+  "ggh4x", "ggtext",
+  "tidytext", "tm", "ggwordcloud", "udpipe", "stopwords"
 )
 missing <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
 if (length(missing) > 0) install.packages(missing, repos = "https://cloud.r-project.org")
@@ -53,6 +54,10 @@ library(Rtsne)
 library(fpc)
 library(ggh4x)
 library(ggtext)
+library(tidytext)
+library(ggwordcloud)
+# NOTE: tm is intentionally NOT attached because library(tm) loads NLP,
+# which masks ggplot2::annotate(). We use tm::stopwords("italian") via namespace.
 theme_set(theme_minimal(base_size = 13))
 set.seed(42)
 
@@ -1701,7 +1706,14 @@ cat_vars_disc <- c("auto", "bici", "mezzi_pub", "piedi", "moto_scooter",
 #   1. Select the top 10% most central members (lowest total Gower distance)
 #   2. Among those, pick the one minimizing discrepancy with cluster aggregates
 #      (sum of |z-scores| for numeric vars + count of mode mismatches for categorical)
-medoid_indices <- sapply(levels(df_complete$cluster_final), function(cl) {
+# Also store the full ranked candidate list (for fallback when retrieving real interview quotes)
+cluster_levels <- levels(df_complete$cluster_final)
+medoid_indices <- integer(length(cluster_levels))
+names(medoid_indices) <- cluster_levels
+medoid_candidates_list <- vector("list", length(cluster_levels))
+names(medoid_candidates_list) <- cluster_levels
+
+for (cl in cluster_levels) {
   idx <- which(df_complete$cluster_final == cl)
   sub_mat <- gower_mat[idx, idx, drop = FALSE]
   total_dist <- rowSums(sub_mat)
@@ -1722,15 +1734,15 @@ medoid_indices <- sapply(levels(df_complete$cluster_final), function(cl) {
 
   discrepancy <- sapply(candidates, function(row_idx) {
     r <- df_complete[row_idx, ]
-    # Numeric: sum of |z-scores|
     z_sum <- sum(abs((sapply(numeric_vars_disc, function(v) r[[v]]) - cl_means) / cl_sds))
-    # Categorical: count of mode mismatches
     cat_miss <- sum(sapply(cat_vars_disc, function(v) as.character(r[[v]]) != cl_modes[v]))
     z_sum + cat_miss
   })
 
-  candidates[which.min(discrepancy)]
-})
+  ranked <- candidates[order(discrepancy)]
+  medoid_candidates_list[[cl]] <- ranked
+  medoid_indices[cl] <- ranked[1]
+}
 
 # Extract representative rows
 medoid_df <- df_complete |> slice(medoid_indices)
@@ -2114,6 +2126,384 @@ for (i in seq_along(levels(df_complete$cluster_final))) {
     cat("**Le sue priorità per Milano.** \u00ab", prio_names_it[top2[1]], "\u00bb.\n\n", sep = "")
   }
 
+}
+```
+
+## Word Clouds: Temi Distintivi per Cluster
+
+Le interviste registrate durante la rilevazione (campo `Trascrizione rivista da LLM`, disponibile per circa il 50% dei rispondenti) offrono un'ulteriore dimensione qualitativa. Per ciascun cluster presentiamo **due viste complementari**:
+
+- **Vista per frequenza assoluta**: le parole più usate dai membri del cluster, indipendentemente da cosa dicono gli altri gruppi. Mostra di cosa si parla *spontaneamente* di più.
+- **Vista per distintività (TF-IDF)**: le parole più caratteristiche del cluster rispetto agli altri. Mostra cosa rende *unico* il linguaggio del gruppo.
+
+**Pre-processing**:
+
+1. **POS tagging e lemmatizzazione** (UDPipe, modello italiano `italian-isdt`): ogni parola è etichettata per parte del discorso (sostantivo, verbo, aggettivo, avverbio, determinante, preposizione, congiunzione, ecc.) e ridotta al suo lemma (forma di citazione del dizionario). Manteniamo solo le classi *content-bearing*: **NOUN, PROPN, ADJ, VERB**. Le forme flesse (`protetta`, `protezione`, `proteggere`) collassano sui rispettivi lemmi (`proteggere`, `protezione`), e parole funzionali come `alcune` (DET) o `mentre` (SCONJ) vengono escluse direttamente dal filtro POS, senza bisogno di liste arbitrarie.
+2. **Stopwords ricche** sui lemmi: usiamo la lista *stopwords-iso* per l'italiano (~700 voci, ben più completa della lista Snowball di base) più (a) una lista curata di filler conversazionali tipici del parlato (`ecco`, `diciamo`, `cioè`, `tipo`, ecc.), (b) una lista di **verbi italiani ad alta frequenza e bassa specificità tematica** sourced da liste di frequenza standard (CORIS-style) per filtrare verbi come `essere`, `avere`, `fare`, `comportare`, `riguardare`, ecc. che sopravvivono al filtro POS ma non portano contenuto tematico, (c) termini meta dell'intervista (`intervistatore`, `milano`, `città`).
+3. **Filtro per outlier**: una parola è inclusa nel conteggio del cluster solo se compare in **almeno 2 rispondenti distinti** del cluster. Questo elimina parole che un singolo intervistato ripete molte volte (es. nomi propri come "Roma" o errori di trascrizione come "Lumbria") che altrimenti dominerebbero indebitamente la TF-IDF.
+
+> **Nota sulla qualità delle trascrizioni**: utilizziamo la colonna `Trascrizione rivista da LLM`. Il modello non corregge sempre nomi propri o termini pronunciati con accento (es. "Lombardia" → "Lumbria"); il filtro di frequenza per documento attenua naturalmente questi artefatti.
+
+> **Nota tecnica**: l'annotazione UDPipe richiede 1–2 minuti la prima volta che il documento viene compilato. Il risultato viene salvato in `udpipe_annotations.rds`; i rendering successivi caricano il file e sono istantanei. Il modello UDPipe italiano (~30 MB) viene scaricato in `udpipe_models/` la prima volta. Entrambi i percorsi sono da aggiungere a `.gitignore`.
+
+```{r}
+#| label: persona-wordcloud-prep
+
+# --- Build per-respondent text corpus ---
+df_text <- df_complete |>
+  mutate(
+    raw_row = complete_rows,
+    transcription = raw$`Trascrizione rivista da LLM`[complete_rows]
+  ) |>
+  filter(!is.na(transcription), nchar(transcription) > 50) |>
+  mutate(doc_id = row_number())
+
+# Report coverage per cluster
+text_coverage <- df_text |>
+  dplyr::count(cluster_final, name = "n_trascrizioni") |>
+  left_join(
+    df_complete |> dplyr::count(cluster_final, name = "n_totale"),
+    by = "cluster_final"
+  ) |>
+  mutate(copertura = scales::percent(n_trascrizioni / n_totale, accuracy = 1))
+
+text_coverage |>
+  knitr::kable(caption = "Copertura delle trascrizioni per cluster",
+               col.names = c("Cluster", "N. trascrizioni", "N. totale", "Copertura"))
+
+# --- UDPipe: scarica modello (una sola volta) ---
+ud_model_dir <- "udpipe_models"
+if (!dir.exists(ud_model_dir)) dir.create(ud_model_dir)
+ud_files <- list.files(ud_model_dir, pattern = "italian.*\\.udpipe$", full.names = TRUE)
+if (length(ud_files) == 0) {
+  ud_dl <- udpipe::udpipe_download_model(language = "italian", model_dir = ud_model_dir)
+  ud_model_file <- ud_dl$file_model
+} else {
+  ud_model_file <- ud_files[1]
+}
+ud_model <- udpipe::udpipe_load_model(ud_model_file)
+
+# --- Annotazione del corpus (cached to RDS) ---
+annotations_cache <- "udpipe_annotations.rds"
+if (file.exists(annotations_cache)) {
+  annotations <- readRDS(annotations_cache)
+  cat("Annotazioni caricate dalla cache (", nrow(annotations), " token).\n", sep = "")
+} else {
+  cat("Annotazione UDPipe in corso (1-2 min)...\n")
+  annotations <- udpipe::udpipe_annotate(
+    ud_model,
+    x = df_text$transcription,
+    doc_id = as.character(df_text$doc_id)
+  ) |>
+    as.data.frame() |>
+    as_tibble()
+  saveRDS(annotations, annotations_cache)
+  cat("Annotazioni salvate in", annotations_cache, "(", nrow(annotations), " token).\n")
+}
+
+# Restore numeric doc_id and join cluster_final
+annotations <- annotations |>
+  mutate(doc_id = as.integer(doc_id)) |>
+  left_join(df_text |> select(doc_id, cluster_final), by = "doc_id") |>
+  mutate(lemma = tolower(lemma))
+
+# --- Italian stopwords (comprehensive) ---
+italian_sw_iso  <- stopwords::stopwords("it", source = "stopwords-iso")
+italian_sw_snow <- tm::stopwords("italian")
+
+# Verbi italiani ad alta frequenza e bassa specificità tematica
+# (ausiliari, modali, light verbs, verbi di percezione/cognizione/dizione generici)
+generic_verbs <- c(
+  "essere", "avere", "fare", "dire", "dare", "andare", "venire", "stare",
+  "dovere", "potere", "volere", "sapere", "vedere", "sentire", "tenere",
+  "comportare", "implicare", "riguardare", "trattare", "parlare", "pensare",
+  "capire", "credere", "trovare", "diventare", "rimanere", "passare",
+  "portare", "mettere", "lasciare", "guardare", "cercare", "iniziare",
+  "finire", "continuare", "succedere", "accadere", "sembrare", "parere",
+  "risultare", "occorrere", "bisognare", "servire", "valere", "chiedere",
+  "rispondere", "esistere", "rendere", "prendere", "chiamare", "ricordare",
+  "sapere", "conoscere", "ottenere", "ricevere", "concedere"
+)
+
+# Filler conversazionali e termini meta
+custom_sw <- c(
+  "ecco", "diciamo", "cioè", "boh", "mah", "tipo", "comunque",
+  "sicuramente", "praticamente", "abbastanza", "dunque", "quindi",
+  "però", "allora", "magari", "insomma", "appunto", "vabbè",
+  "be'", "beh", "uhm", "mmm", "eh", "ah", "oh",
+  "intervistatore", "intervistato", "intervista",
+  "milano", "milanese", "città", "cosa", "cose", "modo", "esempio",
+  "caso", "anno", "anni", "tempo", "volta", "volte", "parte",
+  "po'", "po"
+)
+
+all_sw <- unique(c(italian_sw_iso, italian_sw_snow, generic_verbs, custom_sw))
+
+# --- Filtro POS + stopwords sui lemmi ---
+content_pos <- c("NOUN", "PROPN", "ADJ", "VERB")
+
+content_tokens <- annotations |>
+  filter(upos %in% content_pos,
+         !is.na(lemma),
+         !lemma %in% all_sw,
+         nchar(lemma) > 2,
+         str_detect(lemma, "^[a-zàèéìòóùç]+$"))  # solo lettere italiane
+
+# --- Per-cluster aggregation with document-frequency filter ---
+words_by_cluster <- content_tokens |>
+  group_by(cluster_final, lemma) |>
+  summarise(
+    n      = dplyr::n(),
+    n_docs = dplyr::n_distinct(doc_id),
+    .groups = "drop"
+  ) |>
+  filter(n_docs >= 2)              # KEY: drop single-respondent outliers
+
+# --- TF-IDF on lemmas ---
+words_tfidf <- words_by_cluster |>
+  bind_tf_idf(lemma, cluster_final, n)
+
+cat("Token content-bearing (NOUN/PROPN/ADJ/VERB, post-stopwords):", nrow(content_tokens),
+    "\nLemmi distinti per cluster (post-filtro):", nrow(words_by_cluster), "\n")
+```
+
+### Vista 1: Parole più frequenti per cluster (frequenza assoluta)
+
+```{r}
+#| label: persona-wordcloud-freq-prep
+
+top_freq <- words_by_cluster |>
+  group_by(cluster_final) |>
+  slice_max(n, n = 30, with_ties = FALSE) |>
+  ungroup()
+```
+
+```{r}
+#| label: persona-wordcloud-freq
+#| fig-height: 6
+#| fig-width: 12
+#| results: asis
+#| echo: false
+
+for (i in seq_along(cluster_levels)) {
+  cl <- cluster_levels[i]
+  cat("\n#### ", cl, "\n\n", sep = "")
+  data <- top_freq |> filter(cluster_final == cl)
+  p <- ggplot(data, aes(label = lemma, size = n)) +
+    geom_text_wordcloud_area(rm_outside = TRUE, eccentricity = 1,
+                              color = cluster_palette[[cl]]) +
+    scale_size_area(max_size = 36) +
+    theme_minimal(base_size = 16) +
+    theme(panel.grid = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          plot.margin = margin(4, 4, 4, 4))
+  print(p)
+  cat("\n")
+}
+```
+
+```{r}
+#| label: persona-wordcloud-freq-table
+
+top_freq |>
+  group_by(cluster_final) |>
+  slice_max(n, n = 10, with_ties = FALSE) |>
+  summarise(parole = paste0(lemma, " (", n, ")", collapse = ", "),
+            .groups = "drop") |>
+  knitr::kable(caption = "Top 10 lemmi più frequenti per cluster (con conteggio totale)",
+               col.names = c("Cluster", "Lemmi (frequenza)"))
+```
+
+### Vista 2: Parole più distintive per cluster (TF-IDF)
+
+```{r}
+#| label: persona-wordcloud-tfidf-prep
+
+top_distinct <- words_tfidf |>
+  group_by(cluster_final) |>
+  slice_max(tf_idf, n = 30, with_ties = FALSE) |>
+  ungroup()
+```
+
+```{r}
+#| label: persona-wordcloud-tfidf
+#| fig-height: 6
+#| fig-width: 12
+#| results: asis
+#| echo: false
+
+for (i in seq_along(cluster_levels)) {
+  cl <- cluster_levels[i]
+  cat("\n#### ", cl, "\n\n", sep = "")
+  data <- top_distinct |> filter(cluster_final == cl)
+  p <- ggplot(data, aes(label = lemma, size = tf_idf)) +
+    geom_text_wordcloud_area(rm_outside = TRUE, eccentricity = 1,
+                              color = cluster_palette[[cl]]) +
+    scale_size_area(max_size = 36) +
+    theme_minimal(base_size = 16) +
+    theme(panel.grid = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          plot.margin = margin(4, 4, 4, 4))
+  print(p)
+  cat("\n")
+}
+```
+
+```{r}
+#| label: persona-wordcloud-tfidf-table
+
+top_distinct |>
+  group_by(cluster_final) |>
+  slice_max(tf_idf, n = 10, with_ties = FALSE) |>
+  summarise(parole_distintive = paste(lemma, collapse = ", "), .groups = "drop") |>
+  knitr::kable(caption = "Top 10 lemmi distintivi per cluster (ordinati per TF-IDF)",
+               col.names = c("Cluster", "Lemmi distintivi (top 10 TF-IDF)"))
+```
+
+## Frasi più rappresentative di ciascun cluster
+
+Invece di citare un'intera intervista, qui selezioniamo le **frasi singole** che meglio incarnano il vocabolario distintivo di ciascun cluster. Le frasi possono provenire da intervistati diversi: l'obiettivo non è ritrarre una persona, ma mostrare il *modo di parlare tipico* del gruppo. La tokenizzazione in frasi e la lemmatizzazione delle parole avvengono con UDPipe (annotazione già calcolata sopra), garantendo coerenza con le word cloud.
+
+Per facilitare la lettura, ciascuna frase selezionata viene mostrata con la **frase precedente e quella successiva** della stessa intervista (quando esistono), in modo da fornire un minimo di contesto. La frase effettivamente selezionata dal nostro punteggio è evidenziata **in grassetto**.
+
+**Criterio di selezione.** Per ogni cluster, definiamo un *insieme distintivo* dei 50 lemmi con TF-IDF più alto (le stesse parole che alimentano la word cloud distintiva). Per ogni frase pronunciata dai membri del cluster, calcoliamo:
+
+$$
+\text{score} = \frac{\sum_{w \in \text{frase} \cap \text{distintive}} \text{tf-idf}(w)}{\sqrt{\text{n. lemmi utili nella frase}}}
+$$
+
+Il numeratore premia le frasi ricche di lemmi cluster-distintivi (ognuno pesato per quanto è specifico al cluster); il denominatore con la radice quadrata penalizza le frasi lunghe che ottengono molti match per puro effetto di lunghezza, senza penalizzare in modo eccessivo le frasi medio-lunghe ben mirate. Filtriamo le frasi con meno di 5 lemmi utili (dopo POS+stopwords) per evitare match casuali su frasi troppo brevi.
+
+```{r}
+#| label: representative-sentences-prep
+
+# Top 50 distinctive lemmas per cluster (with TF-IDF as weight)
+N_TOP_LEMMAS <- 50
+top_distinctive_set <- words_tfidf |>
+  group_by(cluster_final) |>
+  slice_max(tf_idf, n = N_TOP_LEMMAS, with_ties = FALSE) |>
+  ungroup() |>
+  select(cluster_final, lemma, weight = tf_idf)
+
+# --- Use UDPipe sentence boundaries directly from `annotations` ---
+# Build a per-sentence content-token table.
+sentence_lemma_long <- annotations |>
+  filter(upos %in% content_pos,
+         !is.na(lemma),
+         !lemma %in% all_sw,
+         nchar(lemma) > 2,
+         str_detect(lemma, "^[a-zàèéìòóùç]+$")) |>
+  distinct(doc_id, paragraph_id, sentence_id, cluster_final, lemma)
+
+# Useful lemma count per sentence
+sentence_lengths <- sentence_lemma_long |>
+  group_by(doc_id, paragraph_id, sentence_id) |>
+  summarise(n_useful = dplyr::n(), .groups = "drop")
+
+# Reconstruct sentence text from UDPipe `sentence` column
+sentence_text_lookup <- annotations |>
+  distinct(doc_id, paragraph_id, sentence_id, sentence) |>
+  filter(!is.na(sentence), nchar(sentence) > 25)
+
+# --- Match each sentence's lemmas against ITS OWN cluster's distinctive set ---
+sentence_matches <- sentence_lemma_long |>
+  inner_join(top_distinctive_set, by = c("cluster_final", "lemma")) |>
+  group_by(doc_id, paragraph_id, sentence_id, cluster_final) |>
+  summarise(
+    n_match = dplyr::n(),
+    weight_sum = sum(weight),
+    matched_words = paste(unique(lemma), collapse = ", "),
+    .groups = "drop"
+  )
+
+# --- Score, filter and bring sentence text ---
+sentence_scores <- sentence_matches |>
+  left_join(sentence_lengths,
+            by = c("doc_id", "paragraph_id", "sentence_id")) |>
+  filter(n_useful >= 5) |>
+  mutate(score = weight_sum / sqrt(n_useful)) |>
+  inner_join(sentence_text_lookup,
+             by = c("doc_id", "paragraph_id", "sentence_id"))
+
+# --- Build prev/next context lookup for each sentence ---
+# Order all sentences by document position (paragraph then sentence) and add
+# the immediately preceding and following sentence text per document.
+sentence_context <- annotations |>
+  distinct(doc_id, paragraph_id, sentence_id, sentence) |>
+  filter(!is.na(sentence)) |>
+  arrange(doc_id, paragraph_id, sentence_id) |>
+  group_by(doc_id) |>
+  mutate(
+    prev_sentence = lag(sentence),
+    next_sentence = lead(sentence)
+  ) |>
+  ungroup() |>
+  select(doc_id, paragraph_id, sentence_id, prev_sentence, next_sentence)
+
+# Top 4 sentences per cluster, enriched with context
+top_sentences <- sentence_scores |>
+  group_by(cluster_final) |>
+  slice_max(score, n = 4, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(cluster_final, desc(score)) |>
+  left_join(sentence_context,
+            by = c("doc_id", "paragraph_id", "sentence_id"))
+
+cat("Frasi candidate analizzate:", nrow(sentence_scores),
+    "\nFrasi selezionate (top 4 per cluster):", nrow(top_sentences), "\n")
+```
+
+```{r}
+#| label: representative-sentences-display
+#| results: asis
+#| echo: false
+
+# Map doc_id to a stable anonymous label per cluster
+doc_label_lookup <- df_text |>
+  select(doc_id, cluster_final) |>
+  group_by(cluster_final) |>
+  mutate(label = paste0("Intervistato/a ", LETTERS[row_number()])) |>
+  ungroup() |>
+  select(doc_id, label) |>
+  tibble::deframe()
+
+clean_sentence <- function(s) {
+  if (is.null(s) || is.na(s)) return("")
+  trimws(gsub("\\s+", " ", gsub("\n", " ", s)))
+}
+
+for (cl in cluster_levels) {
+  cat("\n### ", cl, "\n\n", sep = "")
+  cluster_top <- top_sentences |> filter(cluster_final == cl)
+  if (nrow(cluster_top) == 0) {
+    cat("*Nessuna frase con sufficienti parole distintive per questo cluster.*\n\n")
+    next
+  }
+  for (j in seq_len(nrow(cluster_top))) {
+    row <- cluster_top[j, ]
+    label <- doc_label_lookup[[as.character(row$doc_id)]]
+    if (is.null(label) || is.na(label)) label <- "Intervistato/a"
+
+    main_s <- clean_sentence(row$sentence)
+    prev_s <- clean_sentence(row$prev_sentence)
+    next_s <- clean_sentence(row$next_sentence)
+
+    # Compose contextualized quote: bold = scored sentence, regular = ±1 context
+    quote_parts <- c(
+      if (nchar(prev_s) > 0) prev_s else NULL,
+      paste0("**", main_s, "**"),
+      if (nchar(next_s) > 0) next_s else NULL
+    )
+    quote_text <- paste(quote_parts, collapse = " ")
+
+    cat("- *Score: ", sprintf("%.2f", row$score),
+        " — ", row$n_match, " parole distintive su ", row$n_useful,
+        " utili — ", label, "*\n", sep = "")
+    cat("  > ", quote_text, "\n", sep = "")
+    cat("  *Parole distintive presenti:* ", row$matched_words, "\n\n", sep = "")
+  }
 }
 ```
 

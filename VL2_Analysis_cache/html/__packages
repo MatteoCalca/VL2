@@ -27,3 +27,6 @@ Rtsne
 fpc
 ggh4x
 ggtext
+tidytext
+ggwordcloud
+syuzhet

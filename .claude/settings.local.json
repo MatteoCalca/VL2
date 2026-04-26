@@ -43,7 +43,8 @@
       "Bash(python3)",
       "Bash(grep -E \"\\\\.\\(csv|rds|RData|R\\)$\")",
       "Bash(grep -E \"^#{1,3} [A-Z]\" \"c:\\\\Users\\\\calcm\\\\Documents\\\\GitHub\\\\VL2\\\\VL2_Analysis.qmd\")",
-      "Bash(find /mnt/c/Users/calcm/Documents/GitHub/VL2 -type f \\\\\\(-name *.R -o -name *.r \\\\\\))"
+      "Bash(find /mnt/c/Users/calcm/Documents/GitHub/VL2 -type f \\\\\\(-name *.R -o -name *.r \\\\\\))",
+      "Bash(git -C c:/Users/calcm/Documents/GitHub/VL2 status --short --untracked-files=normal)"
     ]
   }
 }
